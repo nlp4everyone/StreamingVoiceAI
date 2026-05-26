@@ -1,0 +1,2 @@
+from .word_level_lcp import WordLevelLCP
+from .character_level_lcp import CharacterLevelLCP
