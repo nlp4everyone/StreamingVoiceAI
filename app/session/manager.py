@@ -6,8 +6,17 @@ import uuid
 class SessionManager:
     """Registry that owns all active StreamingSession objects for the process lifetime."""
 
+    _instance: Optional["SessionManager"] = None
+
+    def __new__(cls) -> "SessionManager":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
     def __init__(self):
-        """Initialize with an empty in-memory session registry."""
+        if hasattr(self, "_initialized"):
+            return
+        self._initialized = True
         self.sessions: Dict[str, StreamingSession] = {}
     
     def create_session(self) -> StreamingSession:
