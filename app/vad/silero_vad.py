@@ -73,6 +73,7 @@ class SileroVAD:
                 model='silero_vad',
                 force_reload=False,
                 onnx=False,
+                trust_repo=True,
             )
             # 2. Switch to inference mode — disables dropout and gradient tracking.
             self.model.eval()

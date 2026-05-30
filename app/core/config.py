@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     STT_BATCH_SIZE: int = 1
 
     # NeMo ASR settings
-    NEMO_API_URL: str = "http://localhost:8005/v1/audio/transcriptions"
+    NEMO_API_URL: str = "http://172.17.0.1:8005/v1/audio/transcriptions"
     NEMO_MODEL: str = "nvidia/parakeet-ctc-0.6b-vi"
     
     # WebSocket settings
