@@ -2,10 +2,11 @@ from contextlib import asynccontextmanager
 # FastAPI component
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 # Router
-from app.routers import websocket_router, health_router
+from app.routers import websocket_router, health_router, web_router
 from app import startup
+import os
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -33,8 +34,16 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # Serve static files (CSS, JS)
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
     # Include routers
     app.include_router(websocket_router)
     app.include_router(health_router)
+    app.include_router(web_router)
+
+    return app
+
 
 app = create_app()
