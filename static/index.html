@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>Voice AI</title>
+    <link rel="stylesheet" href="/static/index.css">
+</head>
+<body>
+    <div class="app">
+        <header class="header">
+            <span class="app-name">Voice AI</span>
+            <span class="conn-badge connecting" id="connBadge">Connecting</span>
+        </header>
+
+        <main class="main">
+            <!-- Record card -->
+            <div class="card record-card">
+                <button id="recordBtn" class="record-btn" onclick="toggleRecording()" disabled aria-label="Toggle recording">
+                    <span class="icon-mic">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M12 2a3 3 0 0 1 3 3v7a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3z"/>
+                            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                            <line x1="12" y1="19" x2="12" y2="23"/>
+                            <line x1="8" y1="23" x2="16" y2="23"/>
+                        </svg>
+                    </span>
+                    <span class="icon-stop" hidden>
+                        <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="currentColor">
+                            <rect x="4" y="4" width="16" height="16" rx="3"/>
+                        </svg>
+                    </span>
+                </button>
+
+                <div class="record-meta">
+                    <span id="recordStatus" class="status-text">Ready</span>
+                    <span class="meta-sep">·</span>
+                    <span id="recordTimer" class="timer">00:00</span>
+                </div>
+
+                <div class="level-meter" aria-hidden="true">
+                    <div id="levelBar" class="level-bar"></div>
+                </div>
+
+                <p class="hint">Press <kbd>Space</kbd> to toggle recording</p>
+            </div>
+
+            <!-- Transcripts card -->
+            <div class="card transcripts-card">
+                <div class="card-header">
+                    <h2 class="card-title">Transcripts</h2>
+                    <button class="clear-btn" onclick="clearMessages()">Clear</button>
+                </div>
+                <div class="messages" id="messages">
+                    <p class="empty-hint" id="emptyHint">Transcripts will appear here…</p>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="/static/index.js"></script>
+</body>
+</html>

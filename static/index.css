@@ -1,0 +1,359 @@
+:root {
+    --bg:           #f4f4f5;
+    --surface:      #ffffff;
+    --border:       #e4e4e7;
+    --text:         #18181b;
+    --text-muted:   #71717a;
+    --primary:      #6366f1;
+    --primary-dark: #4f46e5;
+    --danger:       #ef4444;
+    --danger-dark:  #dc2626;
+    --success:      #22c55e;
+    --warning:      #f59e0b;
+    --info:         #3b82f6;
+
+    --radius:   12px;
+    --radius-sm: 8px;
+    --shadow:   0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.06);
+}
+
+*, *::before, *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100dvh;
+    -webkit-font-smoothing: antialiased;
+}
+
+/* ── App shell ── */
+.app {
+    max-width: 640px;
+    margin: 0 auto;
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+}
+
+/* ── Header ── */
+.header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 20px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}
+
+.app-name {
+    font-size: 17px;
+    font-weight: 700;
+    letter-spacing: -0.3px;
+    color: var(--text);
+}
+
+.conn-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 4px 10px;
+    border-radius: 99px;
+}
+
+.conn-badge::before {
+    content: '';
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: currentColor;
+    flex-shrink: 0;
+}
+
+.conn-badge.connecting  { background: #fef3c7; color: #92400e; }
+.conn-badge.connected   { background: #dcfce7; color: #166534; }
+.conn-badge.disconnected{ background: #fee2e2; color: #991b1b; }
+
+/* ── Main content ── */
+.main {
+    flex: 1;
+    padding: 20px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+/* ── Card ── */
+.card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 24px 20px;
+}
+
+/* ── Record card ── */
+.record-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+    padding: 32px 20px 24px;
+}
+
+.record-btn {
+    width: 80px;
+    height: 80px;
+    border-radius: 50%;
+    border: none;
+    background: var(--primary);
+    color: white;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s, transform 0.1s, box-shadow 0.15s;
+    box-shadow: 0 4px 14px rgba(99,102,241,0.4);
+    -webkit-tap-highlight-color: transparent;
+}
+
+.record-btn:hover:not(:disabled) {
+    background: var(--primary-dark);
+    transform: translateY(-1px);
+    box-shadow: 0 6px 18px rgba(99,102,241,0.45);
+}
+
+.record-btn:active:not(:disabled) {
+    transform: scale(0.96);
+}
+
+.record-btn.recording {
+    background: var(--danger);
+    box-shadow: 0 4px 14px rgba(239,68,68,0.4);
+    animation: pulse-ring 1.4s ease-in-out infinite;
+}
+
+.record-btn.recording:hover:not(:disabled) {
+    background: var(--danger-dark);
+    box-shadow: 0 6px 18px rgba(239,68,68,0.45);
+}
+
+.record-btn:disabled {
+    background: var(--border);
+    color: var(--text-muted);
+    cursor: not-allowed;
+    box-shadow: none;
+    animation: none;
+}
+
+@keyframes pulse-ring {
+    0%, 100% { box-shadow: 0 4px 14px rgba(239,68,68,0.4); }
+    50%       { box-shadow: 0 4px 24px rgba(239,68,68,0.65); }
+}
+
+.record-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+}
+
+.status-text {
+    font-weight: 600;
+    color: var(--text-muted);
+}
+
+.status-text.recording {
+    color: var(--danger);
+}
+
+.meta-sep {
+    color: var(--border);
+}
+
+.timer {
+    font-variant-numeric: tabular-nums;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 13px;
+    color: var(--text-muted);
+}
+
+/* ── Level meter ── */
+.level-meter {
+    width: 100%;
+    max-width: 240px;
+    height: 6px;
+    background: var(--border);
+    border-radius: 99px;
+    overflow: hidden;
+}
+
+.level-bar {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--success) 0%, var(--warning) 60%, var(--danger) 100%);
+    border-radius: 99px;
+    transition: width 0.05s ease-out;
+}
+
+/* ── Hint / kbd ── */
+.hint {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+kbd {
+    display: inline-block;
+    padding: 1px 6px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    font-family: inherit;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+/* ── Transcripts card ── */
+.card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 14px;
+}
+
+.card-title {
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--text);
+}
+
+.clear-btn {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: var(--radius-sm);
+    transition: background 0.15s, color 0.15s;
+}
+
+.clear-btn:hover {
+    background: var(--bg);
+    color: var(--text);
+}
+
+/* ── Messages ── */
+.messages {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 400px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
+
+.empty-hint {
+    font-size: 13px;
+    color: var(--text-muted);
+    text-align: center;
+    padding: 24px 0;
+    font-style: italic;
+}
+
+.message {
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    border-left: 3px solid transparent;
+    font-size: 14px;
+    line-height: 1.5;
+}
+
+.message.transcript         { background: #eff6ff; border-color: var(--info); }
+.message.transcript.final   { background: #f0fdf4; border-color: var(--success); }
+.message.error              { background: #fef2f2; border-color: var(--danger); }
+.message.session-info       { background: #fffbeb; border-color: var(--warning); }
+.message.system             { background: var(--bg); border-color: var(--border); }
+
+.msg-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+
+.msg-type {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+}
+
+.msg-time {
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-left: auto;
+}
+
+.msg-content {
+    color: var(--text);
+}
+
+/* ── Scrollbar (webkit) ── */
+.messages::-webkit-scrollbar { width: 4px; }
+.messages::-webkit-scrollbar-track { background: transparent; }
+.messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 99px; }
+
+/* ── Responsive ── */
+@media (min-width: 640px) {
+    .app {
+        padding-top: 32px;
+        min-height: unset;
+    }
+
+    .header {
+        border-radius: var(--radius) var(--radius) 0 0;
+        border: 1px solid var(--border);
+        border-bottom: none;
+        position: static;
+    }
+
+    .main {
+        padding: 0;
+    }
+
+    .card {
+        border-radius: 0;
+        border-left: 1px solid var(--border);
+        border-right: 1px solid var(--border);
+        border-top: none;
+    }
+
+    .card:last-child {
+        border-radius: 0 0 var(--radius) var(--radius);
+        border-bottom: 1px solid var(--border);
+        margin-bottom: 32px;
+    }
+}
+
+@media (max-width: 639px) {
+    .record-btn {
+        width: 88px;
+        height: 88px;
+    }
+}
+
+@media (pointer: coarse) {
+    .hint { display: none; }
+}
