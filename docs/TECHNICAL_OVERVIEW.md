@@ -248,6 +248,14 @@ CPU-based Voice Activity Detection loaded from `torch.hub`. A `threading.Lock` s
 all inference calls so concurrent WebSocket sessions cannot corrupt the GRU hidden state.
 `model.reset_states()` is called at the start of each batch to keep clips independent.
 
+Runs via **ONNX runtime** by default (`enable_onnx=True`, env: `VAD_ENABLE_ONNX`). ONNX has
+lower CPU overhead and faster startup than PyTorch JIT; set `VAD_ENABLE_ONNX=false` to fall
+back to the PyTorch backend if `onnxruntime` is unavailable.
+
+The model is instantiated **once at app startup** (`app/startup/__init__.py`) and injected
+into `StreamingHandler` via constructor — ensuring no per-request load cost and a single
+shared instance across all sessions.
+
 - `is_speech(audio, strategy=...)` — binary speech decision via pluggable strategy
 - `get_speech_probability(audio)` — peak frame probability across the window
 - `detect_speech_segments(audio)` — list of `(start_ms, end_ms)` speech segments (used by `_trim_to_speech`)
@@ -321,6 +329,7 @@ previous partial — suppressing no-op updates.
 | `VAD_SAMPLE_RATE` | 16000 | VAD expected sample rate |
 | `VAD_WINDOW_SIZE_SAMPLES` | 512 | Frame size for VAD scoring (32ms at 16kHz) |
 | `VAD_TRIGGER_STRATEGY` | `ema_smoothed` | Active VAD strategy |
+| `VAD_ENABLE_ONNX` | `true` | Use ONNX runtime for VAD (`false` = PyTorch JIT) |
 | `NEMO_API_URL` | `http://localhost:8005/v1/audio/transcriptions` | NeMo server endpoint |
 | `NEMO_MODEL` | `nvidia/parakeet-ctc-0.6b-vi` | Model identifier |
 | `STT_DEVICE` | `cuda` | Device for local model (if used) |

@@ -18,6 +18,8 @@ Intelligent speech detection using Silero VAD running on CPU, with pluggable tri
 
 Automatically identifies speech regions in the rolling audio buffer, enabling efficient processing by skipping silence before sending audio to the ASR engine.
 
+Runs via **ONNX runtime** by default (`VAD_ENABLE_ONNX=true`) for faster load time and lower CPU overhead. The model is preloaded once at app startup and shared across all sessions.
+
 ### 🔄 VAD + ASR Streaming Pipeline
 
 Advanced pipeline architecture that chains VAD and ASR for optimal performance:
@@ -121,7 +123,7 @@ asyncio.run(stream_audio())
 
 - 💻 Runtime: Docker Compose (web service, port configurable via `PORT`)
 
-- 🎯 VAD Model: Silero VAD ([snakers4/silero-vad](https://github.com/snakers4/silero-vad)) loaded via `torch.hub`
+- 🎯 VAD Model: Silero VAD ([snakers4/silero-vad](https://github.com/snakers4/silero-vad)) loaded via `torch.hub`, served via ONNX runtime by default
 
 - 🤖 ASR Model: NVIDIA Parakeet CTC ([nvidia/parakeet-ctc-0.6b-vi](https://huggingface.co/nvidia/parakeet-ctc-0.6b-vi)) via NeMo HTTP API
 
@@ -185,6 +187,7 @@ Key configuration parameters in `app/core/config.py` (all overridable via `.env`
 | `SPEECH_PADDING_MS` | 200 | Context padding around speech region before ASR |
 | `VAD_THRESHOLD` | 0.6 | Silero speech probability cutoff |
 | `VAD_TRIGGER_STRATEGY` | `ema_smoothed` | Active VAD strategy (`consecutive_frames` \| `ema_smoothed` \| `state_machine`) |
+| `VAD_ENABLE_ONNX` | `true` | Use ONNX runtime for VAD inference (faster); set `false` to fall back to PyTorch JIT |
 | `NEMO_API_URL` | `http://172.17.0.1:8005/v1/audio/transcriptions` | NeMo inference server endpoint |
 | `NEMO_MODEL` | `nvidia/parakeet-ctc-0.6b-vi` | ASR model identifier |
 | `HOST` | `0.0.0.0` | Server bind address |
@@ -209,7 +212,9 @@ Key configuration parameters in `app/core/config.py` (all overridable via `.env`
 - [x] Built-in browser UI with microphone recording and live transcripts
 
 ### 🔧 Refactor / Optimization
-- [ ] Optimize SileroVAD with ONNX runtime
+- [x] Optimize SileroVAD with ONNX runtime
+- [x] Preload SileroVAD at app startup (eliminates first-request latency)
+- [x] Bake SileroVAD model into Docker image layer (no runtime download)
 - [ ] Split configuration file
 - [ ] Add comprehensive logging throughout the codebase
 
