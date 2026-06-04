@@ -1,7 +1,4 @@
 python_magic==0.4.27
-# ray==2.54.0
 scipy==1.17.1
 soundfile==0.13.1
-torch==2.11.0
-torchaudio==2.11.0
 onnxruntime==1.26.0

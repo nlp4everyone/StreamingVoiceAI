@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     VAD_SAMPLE_RATE: int = 16000
     VAD_WINDOW_SIZE_SAMPLES: int = 512
     VAD_TRIGGER_STRATEGY: str = "ema_smoothed"  # consecutive_frames | ema_smoothed | state_machine
-    VAD_ENABLE_ONNX: bool = True
+    VAD_MODEL_PATH: str = "/app/models/silero_vad.onnx"
     
     # STT settings
     STT_MODEL_PATH: Optional[str] = None

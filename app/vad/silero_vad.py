@@ -2,14 +2,16 @@ from typing import List, Literal
 from app.core.config import settings
 from app.vad.trigger_strategies import VADTriggerStrategies
 from app.utils.logger import setup_logger
-import torch, threading
+import onnxruntime as ort
+import threading
+import os
 import numpy as np
 
 logger = setup_logger("SileroVAD")
 
 class SileroVAD:
     """
-    Wrapper around the Silero VAD PyTorch model for voice activity detection.
+    Wrapper around the Silero VAD ONNX model for voice activity detection.
 
     Silero VAD is a lightweight GRU-based model that scores 512-sample frames
     (32 ms at 16 kHz) with a speech probability in [0, 1].  This class handles
@@ -20,9 +22,8 @@ class SileroVAD:
     Threading:
         The underlying model is stateful (GRU hidden state).  A ``threading.Lock``
         serialises all inference calls so that concurrent WebSocket sessions cannot
-        corrupt each other's state.  ``model.reset_states()`` is called at the
-        start of every inference batch to ensure each audio clip is scored
-        independently.
+        corrupt each other's state.  Hidden state is reset at the start of every
+        inference batch to ensure each audio clip is scored independently.
 
     Usage::
 
@@ -35,8 +36,7 @@ class SileroVAD:
     def __init__(self,
                  threshold: float = settings.VAD_THRESHOLD,
                  sample_rate: int = settings.VAD_SAMPLE_RATE,
-                 window_size_samples: int = settings.VAD_WINDOW_SIZE_SAMPLES,
-                 enable_onnx: bool = settings.VAD_ENABLE_ONNX):
+                 window_size_samples: int = settings.VAD_WINDOW_SIZE_SAMPLES):
         """
         Args:
             threshold: Speech-probability cutoff used by all detection methods.
@@ -49,16 +49,17 @@ class SileroVAD:
             window_size_samples: Number of samples per inference frame.
                 Must be 256 (16 ms) or 512 (32 ms) at 16 kHz per Silero docs.
                 Defaults to ``settings.VAD_WINDOW_SIZE_SAMPLES``.
-            enable_onnx: Use ONNX runtime instead of PyTorch JIT for inference.
-                ONNX loads faster and has lower CPU overhead; disable only if
-                the onnxruntime package is unavailable.
-                Defaults to ``settings.VAD_ENABLE_ONNX`` (env: ``VAD_ENABLE_ONNX``).
         """
         self.threshold = threshold
         self.sample_rate = sample_rate
         self.window_size_samples = window_size_samples
-        self.enable_onnx = enable_onnx
-        self.model = None
+        self.model: ort.InferenceSession | None = None
+        self._state: np.ndarray | None = None
+        # OnnxWrapper prepends 64 samples of context from the previous frame
+        # before calling the model; without it probabilities are near zero.
+        self._context_size = 64 if sample_rate == 16000 else 32
+        self._context: np.ndarray | None = None
+        self._sr = np.array(sample_rate, dtype=np.int64)  # shape [] (scalar)
         # Silero VAD is stateful (GRU hidden state); serialize concurrent calls
         # so internal state from one clip does not bleed into another.
         self._lock = threading.Lock()
@@ -68,29 +69,57 @@ class SileroVAD:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    # Fallback locations searched when VAD_MODEL_PATH doesn't exist on disk.
+    _FALLBACK_PATHS = [
+        os.path.expanduser(
+            "~/.cache/torch/hub/snakers4_silero-vad_master"
+            "/src/silero_vad/data/silero_vad.onnx"
+        ),
+    ]
+
+    def _resolve_model_path(self) -> str | None:
+        """Return the first model path that exists, or None."""
+        candidates = [settings.VAD_MODEL_PATH] + self._FALLBACK_PATHS
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        logger.error(
+            f"Silero VAD ONNX model not found. Tried: {candidates}"
+        )
+        return None
+
     def _load_model(self) -> None:
         """
-        Download (first run) or load the Silero VAD model from torch.hub cache.
+        Load the Silero VAD ONNX model via ``ort.InferenceSession``.
+        Tries ``settings.VAD_MODEL_PATH`` first, then falls back to the
+        torch-hub cache so local dev works without extra setup.
 
         Sets ``self.model`` to ``None`` on failure so callers can degrade
         gracefully instead of raising at inference time.
         """
+        path = self._resolve_model_path()
+        if path is None:
+            self.model = None
+            return
         try:
-            # 1. Fetch model weights from torch.hub (cached after first download).
-            self.model, _ = torch.hub.load(
-                repo_or_dir='snakers4/silero-vad',
-                model='silero_vad',
-                force_reload=False,
-                onnx=self.enable_onnx,
-                trust_repo=True,
+            self.model = ort.InferenceSession(
+                path,
+                providers=["CPUExecutionProvider"],
             )
-            # 2. Switch to inference mode — OnnxWrapper has no .eval(), PyTorch model does.
-            if not self.enable_onnx:
-                self.model.eval()
-            logger.info(f"Silero VAD model loaded successfully (onnx={self.enable_onnx})")
+            # state input: shape [2, batch=1, hidden] — derive hidden size from metadata.
+            state_meta = next(i for i in self.model.get_inputs() if i.name == "state")
+            self._state = np.zeros(
+                (state_meta.shape[0], 1, state_meta.shape[2]), dtype=np.float32
+            )
+            logger.info(f"Silero VAD model loaded successfully (onnxruntime, path={path})")
         except Exception as e:
             logger.error(f"Failed to load Silero VAD model: {e}")
             self.model = None
+
+    def _reset_states(self) -> None:
+        """Reset GRU state and context to zeros for a fresh audio clip."""
+        self._state[:] = 0.0
+        self._context = np.zeros((1, self._context_size), dtype=np.float32)
 
     def _to_float32(self, audio: np.ndarray) -> np.ndarray:
         """
@@ -109,11 +138,11 @@ class SileroVAD:
             return audio.astype(np.float32)
         return audio
 
-    def _compute_frame_probs(self, audio_tensor: torch.Tensor) -> List[float]:
+    def _compute_frame_probs(self, audio: np.ndarray) -> List[float]:
         """
-        Run Silero VAD on *audio_tensor* and return per-frame speech probabilities.
+        Run Silero VAD on *audio* and return per-frame speech probabilities.
 
-        The tensor is split into non-overlapping windows of
+        The array is split into non-overlapping windows of
         ``window_size_samples`` samples.  Incomplete trailing windows are
         discarded so every scored frame has the same length.
 
@@ -122,7 +151,7 @@ class SileroVAD:
             is reset at entry, making each call independent of previous clips.
 
         Args:
-            audio_tensor: 1-D float32 torch.Tensor at ``self.sample_rate`` Hz.
+            audio: 1-D float32 numpy array at ``self.sample_rate`` Hz.
 
         Returns:
             List of speech probabilities, one per complete frame.
@@ -130,16 +159,29 @@ class SileroVAD:
         """
         # Reset GRU hidden state so this clip is scored independently of the
         # previous call (important when the same instance serves multiple sessions).
-        self.model.reset_states()
+        self._reset_states()
 
         probs = []
-        with torch.no_grad():
-            for i in range(0, len(audio_tensor), self.window_size_samples):
-                chunk = audio_tensor[i:i + self.window_size_samples]
-                # Skip the last partial window — Silero requires a fixed frame size.
-                if len(chunk) < self.window_size_samples:
-                    break
-                probs.append(self.model(chunk, self.sample_rate).item())
+        for i in range(0, len(audio), self.window_size_samples):
+            chunk = audio[i:i + self.window_size_samples]
+            # Skip the last partial window — Silero requires a fixed frame size.
+            if len(chunk) < self.window_size_samples:
+                break
+            # Prepend context from previous frame — model expects [1, context+window].
+            x = np.concatenate([self._context, chunk[np.newaxis, :]], axis=1)
+            ort_outs = self.model.run(
+                None,
+                {
+                    "input": x,
+                    "state": self._state,
+                    "sr": self._sr,
+                },
+            )
+            # output: [1, 1], stateN: updated GRU state
+            prob_arr, self._state = ort_outs[0], ort_outs[1]
+            # Slide context forward: keep last context_size samples of full input.
+            self._context = x[:, -self._context_size:]
+            probs.append(float(prob_arr[0, 0]))
 
         return probs
 
@@ -182,14 +224,12 @@ class SileroVAD:
 
         # 1. Normalise raw PCM to float32 in [-1, 1].
         audio = self._to_float32(audio)
-        # 2. Wrap in a torch tensor for model inference.
-        audio_tensor = torch.from_numpy(audio).float()
 
-        # 3. Compute per-frame speech probabilities (lock serialises GRU state).
+        # 2. Compute per-frame speech probabilities (lock serialises GRU state).
         with self._lock:
-            probs = self._compute_frame_probs(audio_tensor)
+            probs = self._compute_frame_probs(audio)
 
-        # 4. Delegate the binary speech/silence decision to the chosen strategy.
+        # 3. Delegate the binary speech/silence decision to the chosen strategy.
         if strategy == "consecutive_frames":
             return VADTriggerStrategies.detect_by_consecutive_frames(probs, self.threshold, **kwargs)
         elif strategy == "ema_smoothed":
@@ -219,14 +259,12 @@ class SileroVAD:
 
         # 1. Normalise raw PCM to float32 in [-1, 1].
         audio = self._to_float32(audio)
-        # 2. Wrap in a torch tensor for model inference.
-        audio_tensor = torch.from_numpy(audio).float()
 
-        # 3. Compute per-frame speech probabilities (lock serialises GRU state).
+        # 2. Compute per-frame speech probabilities (lock serialises GRU state).
         with self._lock:
-            probs = self._compute_frame_probs(audio_tensor)
+            probs = self._compute_frame_probs(audio)
 
-        # 4. Return the peak probability across all frames.
+        # 3. Return the peak probability across all frames.
         return max(probs) if probs else 0.0
 
     def detect_speech_segments(self,
@@ -259,14 +297,12 @@ class SileroVAD:
 
         # 1. Normalise raw PCM to float32 in [-1, 1].
         audio = self._to_float32(audio)
-        # 2. Wrap in a torch tensor for model inference.
-        audio_tensor = torch.from_numpy(audio).float()
 
-        # 3. Compute per-frame speech probabilities (lock serialises GRU state).
+        # 2. Compute per-frame speech probabilities (lock serialises GRU state).
         with self._lock:
-            probs = self._compute_frame_probs(audio_tensor)
+            probs = self._compute_frame_probs(audio)
 
-        # 4. Walk frames with a threshold state machine to find segment boundaries.
+        # 3. Walk frames with a threshold state machine to find segment boundaries.
         speech_segments = []
         current_speech_start = None  # sample index where the current segment began
         silence_samples = 0          # accumulated sub-threshold samples since last speech frame
