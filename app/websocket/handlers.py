@@ -66,7 +66,8 @@ class StreamingHandler:
             logger.debug(f"[{session_id}] Inference #{session.inference_count} complete")
     
     def _trim_to_speech(self,
-                        audio_window: np.ndarray) -> np.ndarray:
+                        audio_window: np.ndarray,
+                        probs: list) -> np.ndarray:
         """Return the sub-array of audio_window that spans detected speech.
 
         Expands the detected speech boundaries by SPEECH_PADDING_MS on each
@@ -74,9 +75,13 @@ class StreamingHandler:
         around the speech region.  Boundaries are clamped to the window so
         no zero-padding is introduced.  Falls back to the original window
         when no segments are found.
+
+        Args:
+            audio_window: Raw audio samples for the current inference window.
+            probs: Per-frame VAD probabilities already computed by is_speech(),
+                reused here to avoid a second ONNX inference pass.
         """
-        # Detect speech segments via VAD
-        segments = self.vad.detect_speech_segments(audio_window)
+        segments = self.vad.segments_from_probs(probs)
         if not segments:
             logger.debug("No speech segments detected — using full audio window")
             return audio_window
@@ -98,8 +103,8 @@ class StreamingHandler:
             logger.debug(f"[{session.session_id}] Empty audio window — skipping inference")
             return
 
-        # Run VAD
-        is_speech = self.vad.is_speech(audio_window, strategy=settings.VAD_TRIGGER_STRATEGY)
+        # Run VAD — probs are returned to reuse for segment trimming below.
+        is_speech, probs = self.vad.is_speech(audio_window, strategy=settings.VAD_TRIGGER_STRATEGY)
         current_time = datetime.now()
         was_speaking = session.vad_state.is_speaking
         session.vad_state.update(is_speech, current_time)
@@ -115,7 +120,7 @@ class StreamingHandler:
         if is_speech or session.vad_state.is_speaking:
             # Trim to the actual speech region so the ASR model receives
             # clean input rather than a fixed-size window padded with silence.
-            audio_to_transcribe = self._trim_to_speech(audio_window)
+            audio_to_transcribe = self._trim_to_speech(audio_window, probs)
             logger.debug(
                 f"[{session.session_id}] Sending {len(audio_to_transcribe)} samples to ASR "
                 f"(trimmed from {len(audio_window)})"

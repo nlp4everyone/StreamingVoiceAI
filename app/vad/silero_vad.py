@@ -192,7 +192,7 @@ class SileroVAD:
     def is_speech(self,
                   audio: np.ndarray,
                   strategy: Literal["consecutive_frames", "ema_smoothed", "state_machine"] = "consecutive_frames",
-                  **kwargs) -> bool:
+                  **kwargs) -> tuple[bool, List[float]]:
         """
         Determine whether *audio* contains speech using the selected strategy.
 
@@ -213,14 +213,16 @@ class SileroVAD:
                 (e.g. ``min_speech_frames=4``, ``alpha=0.2``, ``onset_frames=3``).
 
         Returns:
-            ``True`` if the strategy declares speech, ``False`` otherwise.
-            Returns ``False`` immediately if the model failed to load.
+            Tuple of (decision, probs): ``decision`` is ``True`` if the strategy
+            declares speech; ``probs`` is the list of per-frame probabilities so
+            callers can reuse them (e.g. for segment trimming) without a second
+            inference pass. Returns ``(False, [])`` if the model failed to load.
 
         Raises:
             ValueError: If *strategy* is not one of the recognised values.
         """
         if self.model is None:
-            return False
+            return False, []
 
         # 1. Normalise raw PCM to float32 in [-1, 1].
         audio = self._to_float32(audio)
@@ -231,13 +233,15 @@ class SileroVAD:
 
         # 3. Delegate the binary speech/silence decision to the chosen strategy.
         if strategy == "consecutive_frames":
-            return VADTriggerStrategies.detect_by_consecutive_frames(probs, self.threshold, **kwargs)
+            decision = VADTriggerStrategies.detect_by_consecutive_frames(probs, self.threshold, **kwargs)
         elif strategy == "ema_smoothed":
-            return VADTriggerStrategies.detect_by_ema_smoothed(probs, self.threshold, **kwargs)
+            decision = VADTriggerStrategies.detect_by_ema_smoothed(probs, self.threshold, **kwargs)
         elif strategy == "state_machine":
-            return VADTriggerStrategies.detect_by_state_machine(probs, self.threshold, **kwargs)
+            decision = VADTriggerStrategies.detect_by_state_machine(probs, self.threshold, **kwargs)
         else:
             raise ValueError(f"Unknown VAD strategy: {strategy}")
+
+        return decision, probs
 
     def get_speech_probability(self, audio: np.ndarray) -> float:
         """
@@ -267,6 +271,65 @@ class SileroVAD:
         # 3. Return the peak probability across all frames.
         return max(probs) if probs else 0.0
 
+    def segments_from_probs(self,
+                            probs: List[float],
+                            min_speech_duration_ms: int = 250,
+                            min_silence_duration_ms: int = 100) -> list:
+        """
+        Locate speech segments from pre-computed per-frame probabilities.
+
+        Prefer this over :meth:`detect_speech_segments` when frame probabilities
+        are already available (e.g. returned by :meth:`is_speech`) to avoid a
+        second ONNX inference pass on the same audio.
+
+        Args:
+            probs: Per-frame speech probabilities as returned by ``is_speech``.
+            min_speech_duration_ms: Minimum duration (ms) for a segment to be
+                included in the output.  Filters out very short noise bursts.
+            min_silence_duration_ms: How long silence must last (ms) before the
+                current segment is closed.  Higher values merge nearby words.
+
+        Returns:
+            List of ``(start_ms, end_ms)`` tuples, one per detected segment.
+        """
+        speech_segments = []
+        current_speech_start = None
+        silence_samples = 0
+
+        for frame_idx, prob in enumerate(probs):
+            sample_offset = frame_idx * self.window_size_samples
+
+            if prob > self.threshold:
+                if current_speech_start is None:
+                    current_speech_start = sample_offset
+                silence_samples = 0
+            else:
+                if current_speech_start is not None:
+                    silence_samples += self.window_size_samples
+                    silence_ms = (silence_samples / self.sample_rate) * 1000
+
+                    if silence_ms >= min_silence_duration_ms:
+                        end_sample = sample_offset
+                        speech_ms = ((end_sample - current_speech_start) / self.sample_rate) * 1000
+
+                        if speech_ms >= min_speech_duration_ms:
+                            start_ms = (current_speech_start / self.sample_rate) * 1000
+                            end_ms = (end_sample / self.sample_rate) * 1000
+                            speech_segments.append((start_ms, end_ms))
+
+                        current_speech_start = None
+                        silence_samples = 0
+
+        if current_speech_start is not None:
+            total_samples = len(probs) * self.window_size_samples
+            speech_ms = ((total_samples - current_speech_start) / self.sample_rate) * 1000
+            if speech_ms >= min_speech_duration_ms:
+                start_ms = (current_speech_start / self.sample_rate) * 1000
+                end_ms = (total_samples / self.sample_rate) * 1000
+                speech_segments.append((start_ms, end_ms))
+
+        return speech_segments
+
     def detect_speech_segments(self,
                                audio: np.ndarray,
                                min_speech_duration_ms: int = 250,
@@ -274,12 +337,9 @@ class SileroVAD:
         """
         Locate all speech segments in *audio* and return their time boundaries.
 
-        The algorithm is a simple threshold-based state machine:
-
-        - A segment starts when a frame exceeds ``self.threshold``.
-        - A segment ends after ``min_silence_duration_ms`` ms of continuous
-          sub-threshold frames.
-        - Segments shorter than ``min_speech_duration_ms`` ms are discarded.
+        Runs a full ONNX inference pass internally. When frame probabilities are
+        already available, use :meth:`segments_from_probs` instead to skip the
+        redundant inference.
 
         Args:
             audio: 1-D numpy array (int16 or float32) at ``self.sample_rate`` Hz.
@@ -295,54 +355,7 @@ class SileroVAD:
         if self.model is None:
             return []
 
-        # 1. Normalise raw PCM to float32 in [-1, 1].
         audio = self._to_float32(audio)
-
-        # 2. Compute per-frame speech probabilities (lock serialises GRU state).
         with self._lock:
             probs = self._compute_frame_probs(audio)
-
-        # 3. Walk frames with a threshold state machine to find segment boundaries.
-        speech_segments = []
-        current_speech_start = None  # sample index where the current segment began
-        silence_samples = 0          # accumulated sub-threshold samples since last speech frame
-
-        for frame_idx, prob in enumerate(probs):
-            sample_offset = frame_idx * self.window_size_samples
-
-            if prob > self.threshold:
-                if current_speech_start is None:
-                    # Speech onset detected — mark the start of a new segment.
-                    current_speech_start = sample_offset
-                # Reset silence accumulator; we are still in speech.
-                silence_samples = 0
-            else:
-                if current_speech_start is not None:
-                    # We are in a potential silence gap inside or after speech.
-                    silence_samples += self.window_size_samples
-                    silence_ms = (silence_samples / self.sample_rate) * 1000
-
-                    if silence_ms >= min_silence_duration_ms:
-                        # Silence has lasted long enough — close the segment.
-                        end_sample = sample_offset
-                        speech_ms = ((end_sample - current_speech_start) / self.sample_rate) * 1000
-
-                        if speech_ms >= min_speech_duration_ms:
-                            start_ms = (current_speech_start / self.sample_rate) * 1000
-                            end_ms = (end_sample / self.sample_rate) * 1000
-                            speech_segments.append((start_ms, end_ms))
-
-                        # Reset for the next potential segment.
-                        current_speech_start = None
-                        silence_samples = 0
-
-        # Handle a segment that reaches the end of the audio without a closing silence.
-        if current_speech_start is not None:
-            total_samples = len(probs) * self.window_size_samples
-            speech_ms = ((total_samples - current_speech_start) / self.sample_rate) * 1000
-            if speech_ms >= min_speech_duration_ms:
-                start_ms = (current_speech_start / self.sample_rate) * 1000
-                end_ms = (total_samples / self.sample_rate) * 1000
-                speech_segments.append((start_ms, end_ms))
-
-        return speech_segments
+        return self.segments_from_probs(probs, min_speech_duration_ms, min_silence_duration_ms)
