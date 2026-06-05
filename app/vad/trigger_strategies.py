@@ -1,4 +1,5 @@
 from typing import List
+from app.core.config import settings
 
 
 class VADTriggerStrategies:
@@ -100,14 +101,20 @@ class VADTriggerStrategies:
     def detect_by_state_machine(probs: List[float],
                                 threshold: float,
                                 onset_frames: int = 2,
-                                offset_frames: int = 3) -> bool:
+                                offset_frames: int = 3,
+                                onset_threshold: float = settings.VAD_ONSET_THRESHOLD,
+                                offset_threshold: float = settings.VAD_OFFSET_THRESHOLD) -> bool:
         """
         FSM with two states (silence / speech) governed by onset and offset
         frame counters.
 
         State transitions:
-            silence → speech : `onset_frames` consecutive frames above threshold
-            speech  → silence: `offset_frames` consecutive frames at or below threshold
+            silence → speech : `onset_frames` consecutive frames above onset_threshold
+            speech  → silence: `offset_frames` consecutive frames at or below offset_threshold
+
+        When onset_threshold > offset_threshold (hysteresis), a probability band
+        [offset_threshold, onset_threshold] is neutral — frames in this band never
+        trigger a transition, eliminating chattering near the decision boundary.
 
         A higher `offset_frames` adds hang-time so brief pauses inside an
         utterance don't prematurely end speech detection.
@@ -116,9 +123,12 @@ class VADTriggerStrategies:
 
         Args:
             probs: Per-frame speech probabilities from Silero VAD.
-            threshold: Frame probability boundary for onset/offset decisions.
-            onset_frames: Frames above threshold needed to enter speech state.
-            offset_frames: Frames at/below threshold needed to leave speech state.
+            threshold: Fallback boundary used when onset_threshold / offset_threshold
+                are not provided (preserves backward compatibility).
+            onset_frames: Frames above onset_threshold needed to enter speech state.
+            offset_frames: Frames at/below offset_threshold needed to leave speech state.
+            onset_threshold: Probability floor for entering speech. Defaults to threshold.
+            offset_threshold: Probability ceiling for leaving speech. Defaults to threshold.
 
         Returns:
             True if the FSM entered the speech state at any point.
@@ -133,7 +143,7 @@ class VADTriggerStrategies:
 
         for prob in probs:
             if state == "silence":
-                if prob > threshold:
+                if prob > onset_threshold:
                     onset_count += 1
                     if onset_count >= onset_frames:
                         # Confirmed speech onset — transition to speech state.
@@ -145,7 +155,7 @@ class VADTriggerStrategies:
                     onset_count = 0
 
             else:  # state == "speech"
-                if prob <= threshold:
+                if prob <= offset_threshold:
                     offset_count += 1
                     if offset_count >= offset_frames:
                         # Sustained silence confirmed — transition back to silence.

@@ -18,8 +18,14 @@ class Settings(BaseSettings):
     VAD_THRESHOLD: float = 0.6
     VAD_SAMPLE_RATE: int = 16000
     VAD_WINDOW_SIZE_SAMPLES: int = 512
+
     VAD_TRIGGER_STRATEGY: str = "ema_smoothed"  # consecutive_frames | ema_smoothed | state_machine
     VAD_MODEL_PATH: str = "/app/models/silero_vad.onnx"
+    # Hysteresis thresholds for state_machine strategy.
+    # onset_threshold > offset_threshold creates a neutral band [offset, onset]
+    # where no state transition occurs, eliminating chattering near the boundary.
+    VAD_ONSET_THRESHOLD: float = 0.65   # prob must exceed this to START speaking
+    VAD_OFFSET_THRESHOLD: float = 0.40  # prob must drop below this to STOP speaking
     
     # STT settings
     STT_MODEL_PATH: Optional[str] = None
