@@ -66,3 +66,7 @@ class TranscriptionService:
         ready = self.asr_engine.is_ready()
         logger.info(f"ASR engine ready: {ready}")
         return ready
+
+    async def aclose(self) -> None:
+        """Release the ASR engine's shared HTTP session."""
+        await self.asr_engine.aclose()

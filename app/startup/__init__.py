@@ -35,5 +35,6 @@ async def startup() -> None:
 
 async def shutdown() -> None:
     logger.info("Shutting down services...")
-    # Future resource cleanup (DB connections, thread pools, etc.)
+    if streaming_handler:
+        await streaming_handler.transcription_service.aclose()
     logger.info("Services shut down.")

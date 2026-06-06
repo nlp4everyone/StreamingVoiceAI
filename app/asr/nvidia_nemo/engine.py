@@ -3,6 +3,7 @@ import soundfile as sf
 from app.core.config import settings
 from app.utils.logger import setup_logger
 import requests, aiohttp, io
+from typing import Optional
 
 logger = setup_logger("NvidiaNemoASR")
 
@@ -39,6 +40,11 @@ class NvidiaNemoASREngine:
         self.api_url = api_url
         self.model = model
         self.sample_rate = sample_rate
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._timeout = aiohttp.ClientTimeout(
+            connect=settings.ASR_CONNECT_TIMEOUT,
+            total=settings.ASR_REQUEST_TIMEOUT,
+        )
 
     def _to_wav_bytes(self,
                       audio: np.ndarray) -> io.BytesIO:
@@ -113,15 +119,21 @@ class NvidiaNemoASREngine:
         logger.debug(f"NeMo ASR response: '{text}'")
         return text
 
+    def _get_session(self) -> aiohttp.ClientSession:
+        """Return the shared ClientSession, creating it if needed."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=self._timeout)
+        return self._session
+
     async def atranscribe(self,
                           audio: np.ndarray) -> str:
         """
         Async version of :meth:`transcribe` using ``aiohttp``.
 
         Encodes *audio* as WAV and POSTs it to the NeMo server without
-        blocking the event loop. Prefer this method inside ``async``
-        request handlers or WebSocket coroutines; use :meth:`transcribe`
-        only in synchronous contexts.
+        blocking the event loop. Reuses a shared ``ClientSession`` across
+        calls for connection pooling; call :meth:`aclose` on shutdown to
+        release the underlying connections.
 
         Args:
             audio: 1-D numpy array of audio samples (int16 or float32)
@@ -131,34 +143,31 @@ class NvidiaNemoASREngine:
             Transcript string, or ``""`` if the server returns no text.
 
         Raises:
-            aiohttp.ClientResponseError: If the server returns a non-2xx
-                status (equivalent of ``raise_for_status``).
-            aiohttp.ClientError: On connection or timeout errors.
+            aiohttp.ClientResponseError: If the server returns a non-2xx status.
+            asyncio.TimeoutError: If the request exceeds ``NEMO_REQUEST_TIMEOUT``.
+            aiohttp.ClientError: On connection or other network errors.
         """
-        # Step 1: encode numpy audio to 16-bit PCM WAV in memory.
-        # _to_wav_bytes is CPU-bound but fast (<1 ms for typical chunks),
-        # so running it inline is fine without run_in_executor.
         wav_bytes = self._to_wav_bytes(audio)
         logger.debug(f"Async posting {len(audio)} samples to NeMo ASR at {self.api_url}")
 
-        # Step 2: build the multipart form payload.
         form = aiohttp.FormData()
         form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
         form.add_field("model", self.model)
         form.add_field("response_format", "verbose_json")
 
-        # Step 3: POST asynchronously; a new ClientSession per call keeps
-        # the engine stateless — no shared session to manage or close.
-        async with aiohttp.ClientSession() as session:
-            async with session.post(self.api_url, data=form) as response:
-                # Step 4: raise on HTTP errors (4xx / 5xx).
-                response.raise_for_status()
+        session = self._get_session()
+        async with session.post(self.api_url, data=form) as response:
+            response.raise_for_status()
+            body = await response.json(content_type=None)
+            text = body.get("text", "")
+            logger.debug(f"NeMo ASR async response: '{text}'")
+            return text
 
-                # Step 5: parse JSON and extract transcript.
-                body = await response.json(content_type=None)
-                text = body.get("text", "")
-                logger.debug(f"NeMo ASR async response: '{text}'")
-                return text
+    async def aclose(self) -> None:
+        """Close the shared ClientSession and release underlying connections."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
 
     def is_ready(self) -> bool:
         """

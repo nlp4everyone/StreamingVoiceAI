@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     # NeMo ASR settings
     NEMO_API_URL: str = "http://172.17.0.1:8005/v1/audio/transcriptions"
     NEMO_MODEL: str = "nvidia/parakeet-ctc-0.6b-vi"
+    ASR_CONNECT_TIMEOUT: float = 2.0   # seconds to establish TCP connection
+    ASR_REQUEST_TIMEOUT: float = 10.0  # seconds for full request (connect + transfer + response)
     
     # WebSocket settings
     WS_MAX_QUEUE_SIZE: int = 100
