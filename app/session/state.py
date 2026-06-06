@@ -1,5 +1,6 @@
 """Per-session mutable state: audio buffer, VAD FSM, and transcript accumulator."""
 
+import asyncio
 from typing import Optional
 from datetime import datetime
 from app.audio.buffer import RingAudioBuffer
@@ -100,6 +101,12 @@ class StreamingSession:
         # Tracks when the last VAD+STT cycle ran to enforce INFERENCE_INTERVAL_MS pacing.
         self.last_inference_time: Optional[datetime] = None
         self.inference_count = 0
+
+        # Per-session inference pipeline: bounded queue + background worker task.
+        # Audio windows are snapshot-enqueued by the receive loop; the worker
+        # drains them independently so receive is never blocked by ASR latency.
+        self.audio_queue: asyncio.Queue = asyncio.Queue(maxsize=settings.INFERENCE_QUEUE_MAXSIZE)
+        self.inference_task: Optional[asyncio.Task] = None
     
     def update_activity(self) -> None:
         """Refresh the idle timestamp; used by cleanup_inactive_sessions to detect stale sessions."""
@@ -118,3 +125,6 @@ class StreamingSession:
         self.transcript_state.reset()
         self.last_inference_time = None
         self.inference_count = 0
+        # Drain the queue so the worker doesn't process stale windows after reset.
+        while not self.audio_queue.empty():
+            self.audio_queue.get_nowait()

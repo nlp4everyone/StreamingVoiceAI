@@ -28,6 +28,7 @@ async def websocket_stream(websocket: WebSocket):
 
     await startup.connection_manager.connect(websocket, session_id)
     await startup.connection_manager.send_session_info(session_id, "connected")
+    startup.streaming_handler.start_inference_worker(session)
 
     try:
         # Step 2: Main message loop — receive and dispatch client messages
