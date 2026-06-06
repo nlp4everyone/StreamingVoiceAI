@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import numpy as np
 from datetime import datetime
 from typing import Optional
@@ -21,7 +22,8 @@ class StreamingHandler:
     def __init__(self,
                  connection_manager: ConnectionManager,
                  session_manager: SessionManager,
-                 vad: Optional[SileroVAD] = None,
+                 vad_pool: Optional[asyncio.Queue] = None,
+                 vad_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None,
                  inference_semaphore: Optional[asyncio.Semaphore] = None):
         self.connection_manager = connection_manager
         self.session_manager = session_manager
@@ -29,8 +31,22 @@ class StreamingHandler:
         self.streaming_service = StreamingService()
         self.transcription_service = TranscriptionService()
         self.stabilization_service = StabilizationService()
-        self.vad = vad if vad is not None else SileroVAD()
         self.inference_semaphore = inference_semaphore or asyncio.Semaphore(settings.ASR_SEMAPHORE_LIMIT)
+
+        if vad_pool is None:
+            # Fallback for tests / standalone use: build a single-instance pool.
+            vad_pool = asyncio.Queue()
+            vad_pool.put_nowait(SileroVAD())
+            vad_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="vad"
+            )
+        self.vad_pool = vad_pool
+        self.vad_executor = vad_executor
+        # Reference for non-inference calls (segments_from_probs is pure Python,
+        # no lock or ONNX — safe to share while inference runs on another instance).
+        self._vad_ref: SileroVAD = self.vad_pool.get_nowait()
+        self.vad_pool.put_nowait(self._vad_ref)
+
         logger.info("StreamingHandler initialized")
 
     # ------------------------------------------------------------------
@@ -171,11 +187,32 @@ class StreamingHandler:
         except asyncio.CancelledError:
             logger.debug(f"[{session_id}] Inference worker cancelled")
 
+    async def _run_vad(self, audio_window: np.ndarray) -> tuple:
+        """
+        Checkout a VAD instance from the pool, run is_speech() on a dedicated
+        thread, then return the instance to the pool.
+
+        Using run_in_executor releases the event loop during ONNX inference so
+        all 200 receive loops remain responsive.  VAD_POOL_SIZE instances run
+        truly in parallel — no shared threading.Lock contention between them.
+        """
+        vad = await self.vad_pool.get()
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                self.vad_executor,
+                vad.is_speech,
+                audio_window,
+                settings.VAD_TRIGGER_STRATEGY,
+            )
+        finally:
+            self.vad_pool.put_nowait(vad)
+
     def _trim_to_speech(self,
                         audio_window: np.ndarray,
                         probs: list) -> np.ndarray:
         """Return the sub-array of audio_window that spans detected speech."""
-        segments = self.vad.segments_from_probs(probs)
+        segments = self._vad_ref.segments_from_probs(probs)
         if not segments:
             logger.debug("No speech segments detected — using full audio window")
             return audio_window
@@ -192,7 +229,7 @@ class StreamingHandler:
         if len(audio_window) == 0:
             return
 
-        is_speech, probs = self.vad.is_speech(audio_window, strategy=settings.VAD_TRIGGER_STRATEGY)
+        is_speech, probs = await self._run_vad(audio_window)
         current_time = datetime.now()
         was_speaking = session.vad_state.is_speaking
         session.vad_state.update(is_speech, current_time)

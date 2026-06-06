@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     ASR_REQUEST_TIMEOUT: float = 10.0   # seconds for full request (connect + transfer + response)
     ASR_SEMAPHORE_LIMIT: int = 4        # max concurrent NeMo HTTP requests across all sessions
     INFERENCE_QUEUE_MAXSIZE: int = 3    # per-session queue depth; excess windows are dropped
+    VAD_POOL_SIZE: int = 4              # number of parallel VAD instances; match ASR_SEMAPHORE_LIMIT
     
     # WebSocket settings
     WS_MAX_QUEUE_SIZE: int = 100
