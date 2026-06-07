@@ -102,8 +102,16 @@ class SileroVAD:
             self.model = None
             return
         try:
+            sess_options = ort.SessionOptions()
+            sess_options.intra_op_num_threads = 1
+            sess_options.inter_op_num_threads = 1
+            sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            optimized_path = path.replace(".onnx", "_optimized.onnx")
+            sess_options.optimized_model_filepath = optimized_path
             self.model = ort.InferenceSession(
                 path,
+                sess_options=sess_options,
                 providers=["CPUExecutionProvider"],
             )
             # state input: shape [2, batch=1, hidden] — derive hidden size from metadata.
