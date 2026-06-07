@@ -32,9 +32,11 @@ Runs via **ONNX runtime** for faster load time and lower CPU overhead. The model
 
 Advanced pipeline architecture that chains VAD and ASR for optimal performance:
 
-- **Ring buffer**: 12-second rolling deque per session, auto-evicting oldest samples
+- **Ring buffer**: 12-second rolling ring buffer per session — pre-allocated numpy int16 array (~384 KB/session, 14× less memory than a deque)
 - **Sliding inference window**: 6-second window re-evaluated every 400ms for overlapping context
-- **Speech trimming**: VAD crops the inference window to detected speech + padding before ASR
+- **Speech trimming**: VAD crops the inference window to detected speech + padding before ASR; frame probabilities from VAD are reused for trimming to avoid a second ONNX pass
+- **Non-blocking ASR**: audio windows are snapshot-enqueued into a per-session `asyncio.Queue`; a background worker drains the queue under a global semaphore (`ASR_SEMAPHORE_LIMIT`) so the WebSocket receive loop never blocks on ASR latency
+- **Backpressure**: server sends a `backpressure` message to the client when the VAD pool or inference queue is saturated, rate-limited to once per second per session
 - **Silence finalization**: 700ms of silence triggers a final transcript flush
 - **Multi-user**: concurrent sessions are fully isolated with independent buffers and state
 
@@ -174,6 +176,7 @@ Navigate to `http://localhost:8000` and click the microphone button (or press `S
 | Session info | `{"type": "session_info", "session_id": "...", "status": "connected"}` |
 | Partial transcript | `{"type": "transcript", "text": "...", "is_final": false}` |
 | Final transcript | `{"type": "transcript", "text": "...", "is_final": true}` |
+| Backpressure | `{"type": "backpressure", "reason": "queue_full\|vad_pool_exhausted", "dropped_windows": N}` |
 | Error | `{"type": "error", "message": "...", "code": "..."}` |
 
 **Control actions:**
@@ -193,11 +196,18 @@ Key configuration parameters in `app/core/config.py` (all overridable via `.env`
 | `INFERENCE_WINDOW_SECONDS` | 6 | Audio window fed to STT |
 | `SILENCE_THRESHOLD_MS` | 700 | Silence duration before finalize |
 | `SPEECH_PADDING_MS` | 200 | Context padding around speech region before ASR |
-| `VAD_THRESHOLD` | 0.6 | Silero speech probability cutoff |
+| `VAD_THRESHOLD` | 0.6 | Silero speech probability cutoff (`ema_smoothed` / `consecutive_frames`) |
+| `VAD_ONSET_THRESHOLD` | 0.65 | Prob to **enter** speaking state (`state_machine` strategy) |
+| `VAD_OFFSET_THRESHOLD` | 0.40 | Prob to **exit** speaking state — hysteresis band prevents chattering |
 | `VAD_TRIGGER_STRATEGY` | `ema_smoothed` | Active VAD strategy (`consecutive_frames` \| `ema_smoothed` \| `state_machine`) |
+| `VAD_POOL_SIZE` | 8 | Number of parallel VAD instances in the async pool |
 | `VAD_MODEL_PATH` | `/app/models/silero_vad.onnx` | Path to the Silero VAD ONNX model file |
 | `NEMO_API_URL` | `http://172.17.0.1:8005/v1/audio/transcriptions` | NeMo inference server endpoint |
 | `NEMO_MODEL` | `nvidia/parakeet-ctc-0.6b-vi` | ASR model identifier |
+| `ASR_SEMAPHORE_LIMIT` | 8 | Max concurrent NeMo HTTP requests across all sessions |
+| `INFERENCE_QUEUE_MAXSIZE` | 3 | Per-session queue depth; excess windows are dropped and backpressure sent |
+| `ASR_CONNECT_TIMEOUT` | 2.0 | Seconds to establish TCP connection to NeMo server |
+| `ASR_REQUEST_TIMEOUT` | 10.0 | Seconds for full request (connect + transfer + response) |
 | `HOST` | `0.0.0.0` | Server bind address |
 | `PORT` | 8000 | Server port |
 | `WORKERS` | 1 | Uvicorn worker count |
@@ -220,10 +230,13 @@ Key configuration parameters in `app/core/config.py` (all overridable via `.env`
 - [x] Built-in browser UI with microphone recording and live transcripts
 
 ### 🔧 Refactor / Optimization
-- [x] Optimize SileroVAD with ONNX runtime
-- [x] Remove PyTorch/torchaudio dependencies (pure onnxruntime inference, ↓ 91% disk)
-- [x] Preload SileroVAD at app startup (eliminates first-request latency)
-- [x] Bake SileroVAD model into Docker image layer (no runtime download)
+- [x] Pure ONNX runtime for SileroVAD (no PyTorch, ↓ 91% disk / ↓ 76% RAM)
+- [x] Preload SileroVAD at startup; bake model into Docker image layer
+- [x] Pre-allocated numpy int16 ring buffer (↓ 14× memory vs deque)
+- [x] VAD async pool + per-session inference queue (non-blocking receive loop)
+- [x] Backpressure signaling on VAD pool / queue overload
+- [x] Shared aiohttp ClientSession with configurable timeouts
+- [x] Dual-threshold hysteresis for `state_machine` VAD strategy
 - [x] Add structured logging to all main processing steps
 - [ ] Split configuration file
 

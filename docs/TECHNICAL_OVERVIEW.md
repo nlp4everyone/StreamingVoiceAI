@@ -33,15 +33,22 @@ FastAPI WebSocket Gateway  (/ws/stream)
                 │
                 ▼
         StreamingSession  (per-session state)
-                ├── RingAudioBuffer  (6s rolling deque)
+                ├── RingAudioBuffer  (12s ring buffer, pre-allocated np.int16)
                 ├── VADState         (speaking / silence tracking)
-                └── TranscriptState  (partial / final transcript)
+                ├── TranscriptState  (partial / final transcript)
+                └── inference_queue  (asyncio.Queue, maxsize=INFERENCE_QUEUE_MAXSIZE)
                 │
-                │  every 400ms (StreamingService.should_run_inference)
+                │  handle_audio_packet() enqueues (audio_snapshot, now)
+                │  _inference_worker() drains queue per session
+                ▼
+        StreamingHandler._inference_worker()  [background task per session]
+                │  async with inference_semaphore  (ASR_SEMAPHORE_LIMIT global cap)
                 ▼
         StreamingHandler._run_inference()
                 │
-                ├──▶ SileroVAD.is_speech(4s window, strategy="ema_smoothed")
+                ├──▶ VAD pool (asyncio.Queue of VAD_POOL_SIZE SileroVAD instances)
+                │       acquire instance → run_in_executor → release
+                │       returns (decision, probs)  ← probs reused for trimming
                 │         └── VADTriggerStrategies
                 │               (consecutive_frames | ema_smoothed | state_machine)
                 │
@@ -89,31 +96,39 @@ Client  ← {"type": "transcript", "text": "...", "is_final": false|true}
 ③ StreamingHandler.handle_audio_packet()
     │
     ├─ StreamingService.process_audio_packet()
-    │       RingAudioBuffer.append(packet)   ← deque(maxlen=96000), auto-evict
+    │       RingAudioBuffer.append(packet)   ← pre-allocated np.int16 ring buffer, auto-evict
     │       session.update_activity()
     │
     └─ StreamingService.should_run_inference()
             elapsed >= 400ms since last inference?
                 NO  → return  (wait for next packet)
-               YES  → continue
+               YES  → snapshot audio window → enqueue to session.inference_queue
+                        queue full?  → drop window, send backpressure (rate-limited 1/s)
     │
     ▼
-④ StreamingHandler._run_inference()
+④ StreamingHandler._inference_worker()  [background asyncio task per session]
+    │  async with inference_semaphore  ← global cap (ASR_SEMAPHORE_LIMIT=8)
+    ▼
+    StreamingHandler._run_inference(audio_window)
     │
-    ├─ audio_window = RingAudioBuffer.get_latest(4s)
+    ├─ audio_window = RingAudioBuffer.get_latest(6s)
     │
-    ├─ SileroVAD.is_speech(audio_window, strategy="ema_smoothed")
-    │       _compute_frame_probs()          ← lock-serialised, GRU reset per call
+    ├─ acquire SileroVAD instance from vad_pool (asyncio.Queue, VAD_POOL_SIZE=8)
+    │       run_in_executor → _compute_frame_probs()   ← GRU reset per call
     │       VADTriggerStrategies.ema_smoothed(probs, threshold=0.6, alpha=0.3)
+    │       returns (decision: bool, probs: list[float])
+    │       release instance back to pool
     │
-    │   VADState.update(is_speech, now)
+    │   vad_pool empty?  → drop window, send backpressure (rate-limited 1/s)
+    │
+    │   VADState.update(decision, now)
     │       silence_duration >= 700ms  →  is_speaking = False
     │
-    │   if NOT (is_speech OR vad_state.is_speaking):
+    │   if NOT (decision OR vad_state.is_speaking):
     │       skip STT  ──────────────────────────────────────────────┐
     │                                                               │
-    ├─ _trim_to_speech(audio_window)                                │
-    │       SileroVAD.detect_speech_segments()                      │
+    ├─ _trim_to_speech(audio_window, probs)                         │
+    │       SileroVAD.segments_from_probs(probs)  ← reuse VAD probs │
     │       crop to [first_segment_start - padding,                 │
     │                last_segment_end   + padding]                  │
     │       removes leading/trailing silence before ASR             │
@@ -122,7 +137,9 @@ Client  ← {"type": "transcript", "text": "...", "is_final": false|true}
     ├─ TranscriptionService.atranscribe(trimmed_audio)              │
     │       NvidiaNemoASREngine.atranscribe()                       │
     │           encode as in-memory WAV  (soundfile, PCM 16-bit)    │
-    │           aiohttp POST /v1/audio/transcriptions               │
+    │           shared aiohttp.ClientSession POST                   │
+    │           /v1/audio/transcriptions                            │
+    │           timeout: ASR_CONNECT_TIMEOUT=2s / ASR_REQUEST_TIMEOUT=10s
     │           response["text"]                                    │
     │                                                               │
     ├─ if transcript changed:                                       │
@@ -174,6 +191,7 @@ t=0.8s  [0.8 → 4.8s]
 | Session info | `{"type": "session_info", "session_id": "...", "status": "connected"}` |
 | Partial transcript | `{"type": "transcript", "text": "...", "is_final": false}` |
 | Final transcript | `{"type": "transcript", "text": "...", "is_final": true}` |
+| Backpressure | `{"type": "backpressure", "reason": "queue_full\|vad_pool_exhausted", "dropped_windows": N}` |
 | Error | `{"type": "error", "message": "...", "code": "..."}` |
 
 **Control actions:**
@@ -207,11 +225,12 @@ Entry point for all WebSocket connections. Responsibilities:
 ## StreamingHandler (`app/websocket/handlers.py`)
 
 Per-packet orchestration — the main processing pipeline:
-- `handle_audio_packet()` — appends to buffer, triggers inference every 400ms
-- `_run_inference()` — VAD → trim → STT → stabilize → send
-- `_trim_to_speech()` — crops the 4s inference window to the detected speech region + padding, so the ASR model receives clean input instead of silence-padded audio
+- `handle_audio_packet()` — appends to buffer, snapshots audio window every 400ms and enqueues to the session's `inference_queue`; sends `backpressure` if queue is full
+- `start_inference_worker()` — spawns a background `asyncio.Task` per session that drains `inference_queue` under the global `inference_semaphore`
+- `_run_inference()` — acquires a VAD instance from the pool → VAD → trim → STT → stabilize → send; sends `backpressure` if VAD pool is exhausted
+- `_trim_to_speech(audio_window, probs)` — crops the 6s inference window to the detected speech region + padding using frame probs already computed by `is_speech()`, avoiding a second ONNX pass
 - `handle_control_message()` — `start` resets state; `stop` flushes pending partial as final
-- `cleanup_session()` — flushes pending partial, removes session
+- `cleanup_session()` — stops inference worker, flushes pending partial, removes session
 
 ## ConnectionManager (`app/websocket/manager.py`)
 
@@ -234,39 +253,39 @@ Pydantic models for all message types:
 
 ## Ring Buffer (`app/audio/buffer.py`)
 
-Each session holds up to 6 seconds of PCM samples in a `deque(maxlen=96000)`.
-- `append(audio)` — push new samples, auto-evict oldest
-- `get_latest(seconds)` — extract inference window (returns int16 ndarray)
+Each session holds up to 12 seconds of PCM samples in a pre-allocated `np.int16` array (a true ring buffer with a write-pointer and sample counter). This uses ~384 KB/session — 14× less than the previous `deque`-of-Python-ints approach (5.4 MB).
+
+- `append(audio)` — push new samples using numpy slice writes; wraps around automatically, evicting oldest
+- `get_latest(seconds)` — extract the most-recent N seconds as a contiguous int16 ndarray (O(N) copy, no Python loops)
 - `get_range(start_s, end_s)` — extract a specific time slice
-- `size_seconds()` — elapsed buffer duration
+- `clear()` — reset write pointer and count without reallocating
 
 ## Silero VAD (`app/vad/`)
 
 **`silero_vad.py` — `SileroVAD`**
 
-CPU-based Voice Activity Detection loaded from `torch.hub`. A `threading.Lock` serialises
-all inference calls so concurrent WebSocket sessions cannot corrupt the GRU hidden state.
-`model.reset_states()` is called at the start of each batch to keep clips independent.
+CPU-based Voice Activity Detection running via **pure ONNX runtime** — no PyTorch dependency.
+The model is driven directly via `ort.InferenceSession`; GRU hidden state is reset at the start
+of each inference call to keep clips independent.
 
-Runs via **ONNX runtime** by default (`enable_onnx=True`, env: `VAD_ENABLE_ONNX`). ONNX has
-lower CPU overhead and faster startup than PyTorch JIT; set `VAD_ENABLE_ONNX=false` to fall
-back to the PyTorch backend if `onnxruntime` is unavailable.
+At app startup (`app/startup/__init__.py`), a **pool of `VAD_POOL_SIZE` (default 8) `SileroVAD`
+instances** is created and placed in an `asyncio.Queue`. Each inference call acquires an instance
+from the pool, runs ONNX inference via `run_in_executor` (dedicated thread), then releases the
+instance back — eliminating the `threading.Lock` bottleneck and allowing up to `VAD_POOL_SIZE`
+concurrent VAD inferences.
 
-The model is instantiated **once at app startup** (`app/startup/__init__.py`) and injected
-into `StreamingHandler` via constructor — ensuring no per-request load cost and a single
-shared instance across all sessions.
-
-- `is_speech(audio, strategy=...)` — binary speech decision via pluggable strategy
+- `is_speech(audio, strategy=...)` — returns `(decision: bool, probs: list[float])`; callers reuse `probs` for speech trimming to avoid a redundant ONNX pass
 - `get_speech_probability(audio)` — peak frame probability across the window
-- `detect_speech_segments(audio)` — list of `(start_ms, end_ms)` speech segments (used by `_trim_to_speech`)
+- `segments_from_probs(probs, ...)` — derive `(start_ms, end_ms)` speech segments directly from a pre-computed probability list (used by `_trim_to_speech`)
+- `detect_speech_segments(audio)` — runs inference then calls `segments_from_probs`; use only when probs are not already available
 
 **`trigger_strategies.py` — `VADTriggerStrategies`**
 
 | Strategy | Mechanism |
 |---|---|
-| `consecutive_frames` | N consecutive frames above threshold (default `min_speech_frames=3`) |
-| `ema_smoothed` | EMA of frame probs > threshold (`alpha=0.3`) — **default** |
-| `state_machine` | FSM: `onset_frames=2` to enter speech, `offset_frames=3` to exit |
+| `consecutive_frames` | N consecutive frames above `VAD_THRESHOLD` (default `min_speech_frames=3`) |
+| `ema_smoothed` | EMA of frame probs > `VAD_THRESHOLD` (`alpha=0.3`) — **default** |
+| `state_machine` | FSM with dual-threshold hysteresis: `onset_frames=2` above `VAD_ONSET_THRESHOLD` (0.65) to enter speech; `offset_frames=3` below `VAD_OFFSET_THRESHOLD` (0.40) to exit — the neutral band [0.40, 0.65] prevents chattering |
 
 ## NvidiaNemoASREngine (`app/asr/nvidia_nemo/engine.py`)
 
@@ -281,7 +300,8 @@ response_format: verbose_json
 ```
 
 - `transcribe(audio)` — synchronous (requests)
-- `atranscribe(audio)` — async, non-blocking (aiohttp) — used by the WebSocket handler
+- `atranscribe(audio)` — async, non-blocking; uses a **shared `aiohttp.ClientSession`** for connection pooling across all inference calls, with configurable timeouts (`ASR_CONNECT_TIMEOUT=2s`, `ASR_REQUEST_TIMEOUT=10s`)
+- `aclose()` — closes the shared `ClientSession`; called from `startup.shutdown()` for clean teardown
 - `is_ready()` — lightweight GET health probe
 - No temp files; audio is encoded to `BytesIO` before upload
 
@@ -320,19 +340,25 @@ previous partial — suppressing no-op updates.
 |---|---|---|
 | `SAMPLE_RATE` | 16000 | Audio sample rate (Hz) |
 | `AUDIO_PACKET_MS` | 20 | Expected client packet size |
-| `RING_BUFFER_SECONDS` | 6 | Max audio retained per session |
+| `RING_BUFFER_SECONDS` | 12 | Max audio retained per session (pre-allocated np.int16 ring buffer) |
 | `INFERENCE_INTERVAL_MS` | 400 | How often VAD+STT runs |
-| `INFERENCE_WINDOW_SECONDS` | 4 | Audio window fed to STT |
+| `INFERENCE_WINDOW_SECONDS` | 6 | Audio window fed to STT |
 | `SILENCE_THRESHOLD_MS` | 700 | Silence before finalize |
 | `SPEECH_PADDING_MS` | 200 | Context padding around speech region before ASR |
-| `VAD_THRESHOLD` | 0.6 | Silero speech probability cutoff |
+| `VAD_THRESHOLD` | 0.6 | Silero speech probability cutoff (`ema_smoothed` / `consecutive_frames`) |
+| `VAD_ONSET_THRESHOLD` | 0.65 | Prob to **enter** speaking state (`state_machine` strategy) |
+| `VAD_OFFSET_THRESHOLD` | 0.40 | Prob to **exit** speaking state — hysteresis band = [0.40, 0.65] |
 | `VAD_SAMPLE_RATE` | 16000 | VAD expected sample rate |
 | `VAD_WINDOW_SIZE_SAMPLES` | 512 | Frame size for VAD scoring (32ms at 16kHz) |
 | `VAD_TRIGGER_STRATEGY` | `ema_smoothed` | Active VAD strategy |
-| `VAD_ENABLE_ONNX` | `true` | Use ONNX runtime for VAD (`false` = PyTorch JIT) |
-| `NEMO_API_URL` | `http://localhost:8005/v1/audio/transcriptions` | NeMo server endpoint |
+| `VAD_POOL_SIZE` | 8 | Number of parallel VAD instances in the async pool |
+| `VAD_MODEL_PATH` | `/app/models/silero_vad.onnx` | Path to the Silero VAD ONNX model |
+| `NEMO_API_URL` | `http://172.17.0.1:8005/v1/audio/transcriptions` | NeMo server endpoint |
 | `NEMO_MODEL` | `nvidia/parakeet-ctc-0.6b-vi` | Model identifier |
-| `STT_DEVICE` | `cuda` | Device for local model (if used) |
+| `ASR_SEMAPHORE_LIMIT` | 8 | Max concurrent NeMo HTTP requests across all sessions |
+| `INFERENCE_QUEUE_MAXSIZE` | 3 | Per-session queue depth; excess windows are dropped |
+| `ASR_CONNECT_TIMEOUT` | 2.0 | Seconds to establish TCP connection to NeMo |
+| `ASR_REQUEST_TIMEOUT` | 10.0 | Seconds for full NeMo request (connect + transfer + response) |
 | `HOST` | `0.0.0.0` | Server bind address |
 | `PORT` | 8000 | Server port |
 | `WORKERS` | 1 | Uvicorn worker count |
@@ -366,7 +392,7 @@ app/
 │   └── context.py
 │
 ├── audio/
-│   ├── buffer.py              # RingAudioBuffer (deque-backed, auto-evict)
+│   ├── buffer.py              # RingAudioBuffer (pre-allocated np.int16 ring buffer, 14× less memory)
 │   ├── chunker.py             # SlidingWindowChunker
 │   ├── preprocessing.py
 │   └── resampler.py
