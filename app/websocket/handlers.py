@@ -196,9 +196,14 @@ class StreamingHandler:
         all 200 receive loops remain responsive.  VAD_POOL_SIZE instances run
         truly in parallel — no shared threading.Lock contention between them.
         """
-        vad = await self.vad_pool.get()
         try:
-            loop = asyncio.get_event_loop()
+            vad = await asyncio.wait_for(self.vad_pool.get(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.error("VAD pool exhausted — all instances busy, dropping inference window")
+            return False, []
+
+        try:
+            loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
                 self.vad_executor,
                 vad.is_speech,
