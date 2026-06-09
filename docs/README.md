@@ -167,7 +167,7 @@ Navigate to `http://localhost:8000` and click the microphone button (or press `S
 | Message | Format |
 |---------|--------|
 | Audio packet | `{"type": "audio", "data": "<base64 PCM int16>", "sample_rate": 16000}` |
-| Control | `{"type": "control", "action": "start\|stop\|pause\|resume"}` |
+| Control | `{"type": "control", "action": "start\|stop"}` |
 
 **Server → Client:**
 
@@ -202,12 +202,17 @@ Key configuration parameters in `app/core/config.py` (all overridable via `.env`
 | `VAD_TRIGGER_STRATEGY` | `ema_smoothed` | Active VAD strategy (`consecutive_frames` \| `ema_smoothed` \| `state_machine`) |
 | `VAD_POOL_SIZE` | 8 | Number of parallel VAD instances in the async pool |
 | `VAD_MODEL_PATH` | `/app/models/silero_vad.onnx` | Path to the Silero VAD ONNX model file |
+| `VAD_USE_INT8` | `false` | Quantize FP32 model to INT8 on first startup (`_int8.onnx` cached on disk) |
 | `NEMO_API_URL` | `http://172.17.0.1:8005/v1/audio/transcriptions` | NeMo inference server endpoint |
 | `NEMO_MODEL` | `nvidia/parakeet-ctc-0.6b-vi` | ASR model identifier |
 | `ASR_SEMAPHORE_LIMIT` | 8 | Max concurrent NeMo HTTP requests across all sessions |
 | `INFERENCE_QUEUE_MAXSIZE` | 3 | Per-session queue depth; excess windows are dropped and backpressure sent |
 | `ASR_CONNECT_TIMEOUT` | 2.0 | Seconds to establish TCP connection to NeMo server |
 | `ASR_REQUEST_TIMEOUT` | 10.0 | Seconds for full request (connect + transfer + response) |
+| `WS_MAX_CONNECTIONS` | `200` | Hard cap on concurrent WebSocket sessions; excess connections closed with code 1013 |
+| `WS_MAX_QUEUE_SIZE` | `100` | Per-connection send queue depth |
+| `WS_PING_INTERVAL` | `20` | Keepalive ping interval (s) |
+| `WS_PING_TIMEOUT` | `20` | Ping response timeout (s) |
 | `HOST` | `0.0.0.0` | Server bind address |
 | `PORT` | 8000 | Server port |
 | `WORKERS` | 1 | Uvicorn worker count |
