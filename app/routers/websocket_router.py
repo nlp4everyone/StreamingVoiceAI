@@ -34,6 +34,7 @@ async def websocket_stream(websocket: WebSocket):
         # Step 2: Main message loop — receive and dispatch client messages
         while True:
             data = await websocket.receive_text()
+            session.update_activity()
 
             try:
                 # Step 3: Parse JSON and route by message type

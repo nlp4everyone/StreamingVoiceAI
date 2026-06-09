@@ -158,6 +158,17 @@ class ConnectionManager:
         for session_id in disconnected:
             self.disconnect(session_id)
     
+    async def close_idle_session(self, session_id: str) -> None:
+        """Send a close frame to an idle session; triggers WebSocketDisconnect in the router."""
+        websocket = self.active_connections.get(session_id)
+        if websocket is None:
+            return
+        try:
+            await websocket.close(code=1000, reason="idle_timeout")
+            logger.info(f"[{session_id}] Closed idle WebSocket (idle_timeout)")
+        except Exception as e:
+            logger.debug(f"[{session_id}] close_idle_session error (already gone?): {e}")
+
     def get_connection_count(self) -> int:
         """Get the number of active connections."""
         return len(self.active_connections)

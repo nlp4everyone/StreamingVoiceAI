@@ -19,6 +19,30 @@ streaming_handler: StreamingHandler = None  # type: ignore[assignment]
 inference_semaphore: asyncio.Semaphore = None  # type: ignore[assignment]
 vad_pool: asyncio.Queue = None  # type: ignore[assignment]
 vad_executor: concurrent.futures.ThreadPoolExecutor = None  # type: ignore[assignment]
+_cleanup_task: asyncio.Task = None  # type: ignore[assignment]
+
+_IDLE_CLEANUP_INTERVAL_S: int = 60
+_IDLE_SESSION_TIMEOUT_S: int = 300
+
+
+async def _idle_cleanup_loop() -> None:
+    """Close WebSockets for sessions idle > _IDLE_SESSION_TIMEOUT_S.
+
+    Closing triggers WebSocketDisconnect in the router, which runs the
+    existing full cleanup path (cancel inference task, remove session, etc.).
+    """
+    while True:
+        await asyncio.sleep(_IDLE_CLEANUP_INTERVAL_S)
+        if session_manager is None or connection_manager is None:
+            continue
+        inactive_ids = [
+            sid for sid, s in list(session_manager.sessions.items())
+            if not s.is_active(_IDLE_SESSION_TIMEOUT_S)
+        ]
+        if inactive_ids:
+            logger.info(f"Idle cleanup: closing {len(inactive_ids)} session(s)")
+        for sid in inactive_ids:
+            await connection_manager.close_idle_session(sid)
 
 
 def _maybe_quantize_vad() -> None:
@@ -82,11 +106,20 @@ async def startup() -> None:
         inference_semaphore=inference_semaphore,
     )
 
+    global _cleanup_task
+    _cleanup_task = asyncio.create_task(_idle_cleanup_loop(), name="idle-cleanup")
+
     logger.info("Services initialized.")
 
 
 async def shutdown() -> None:
     logger.info("Shutting down services...")
+    if _cleanup_task and not _cleanup_task.done():
+        _cleanup_task.cancel()
+        try:
+            await _cleanup_task
+        except asyncio.CancelledError:
+            pass
     if streaming_handler:
         await streaming_handler.transcription_service.aclose()
     if vad_executor:
