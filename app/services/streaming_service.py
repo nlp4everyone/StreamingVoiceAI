@@ -33,13 +33,13 @@ class StreamingService:
 
         buffer_seconds = session.audio_buffer.size_seconds()
         logger.debug(
-            f"[{session.session_id}] Audio packet appended — "
-            f"buffer={buffer_seconds:.2f}s / {settings.INFERENCE_WINDOW_SECONDS}s"
+            "[%s] Audio packet appended — buffer=%.2fs / %ss",
+            session.session_id, buffer_seconds, settings.INFERENCE_WINDOW_SECONDS,
         )
 
         # Check if we should run inference
         if buffer_seconds >= settings.INFERENCE_WINDOW_SECONDS:
-            logger.debug(f"[{session.session_id}] Buffer full — inference triggered")
+            logger.debug("[%s] Buffer full — inference triggered", session.session_id)
             return True
 
         return False
@@ -57,8 +57,8 @@ class StreamingService:
         """
         window = session.audio_buffer.get_latest(settings.INFERENCE_WINDOW_SECONDS)
         logger.debug(
-            f"[{session.session_id}] Inference window fetched — {len(window)} samples "
-            f"({settings.INFERENCE_WINDOW_SECONDS}s)"
+            "[%s] Inference window fetched — %d samples (%ss)",
+            session.session_id, len(window), settings.INFERENCE_WINDOW_SECONDS,
         )
         return window
     
@@ -74,13 +74,13 @@ class StreamingService:
             True if inference should run
         """
         if session.last_inference_time is None:
-            logger.debug(f"[{session.session_id}] First inference — no previous timestamp")
+            logger.debug("[%s] First inference — no previous timestamp", session.session_id)
             return True
 
         elapsed_ms = (datetime.now() - session.last_inference_time).total_seconds() * 1000
         ready = elapsed_ms >= settings.INFERENCE_INTERVAL_MS
         logger.debug(
-            f"[{session.session_id}] Inference interval check — "
-            f"elapsed={elapsed_ms:.0f}ms threshold={settings.INFERENCE_INTERVAL_MS}ms ready={ready}"
+            "[%s] Inference interval check — elapsed=%.0fms threshold=%sms ready=%s",
+            session.session_id, elapsed_ms, settings.INFERENCE_INTERVAL_MS, ready,
         )
         return ready

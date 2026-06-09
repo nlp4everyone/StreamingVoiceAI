@@ -117,8 +117,6 @@ class SileroVAD:
             sess_options.inter_op_num_threads = 1
             sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
             sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            optimized_path = path.replace(".onnx", "_optimized.onnx")
-            sess_options.optimized_model_filepath = optimized_path
             self.model = ort.InferenceSession(
                 path,
                 sess_options=sess_options,
@@ -132,7 +130,7 @@ class SileroVAD:
             self._input_buf = np.zeros(
                 (1, self._context_size + self.window_size_samples), dtype=np.float32
             )
-            logger.info(f"Silero VAD model loaded successfully (onnxruntime, path={path})")
+            logger.debug("Silero VAD model loaded (onnxruntime, path=%s)", path)
         except Exception as e:
             logger.error(f"Failed to load Silero VAD model: {e}")
             self.model = None

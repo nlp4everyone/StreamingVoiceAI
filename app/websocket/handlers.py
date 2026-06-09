@@ -90,8 +90,8 @@ class StreamingHandler:
                 session.last_inference_time = datetime.now()
                 session.inference_count += 1
                 logger.debug(
-                    f"[{session_id}] Enqueued inference #{session.inference_count} "
-                    f"(queue size: {session.audio_queue.qsize()})"
+                    "[%s] Enqueued inference #%d (queue size: %d)",
+                    session_id, session.inference_count, session.audio_queue.qsize(),
                 )
             except asyncio.QueueFull:
                 session.dropped_windows += 1
@@ -102,8 +102,8 @@ class StreamingHandler:
                         session_id, "queue_full", session.dropped_windows
                     )
                 logger.debug(
-                    f"[{session_id}] Inference queue full — dropping window "
-                    f"(total drops: {session.dropped_windows})"
+                    "[%s] Inference queue full — dropping window (total drops: %d)",
+                    session_id, session.dropped_windows,
                 )
 
     async def handle_control_message(self,
