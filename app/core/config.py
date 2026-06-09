@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     VAD_POOL_SIZE: int = 8              # number of parallel VAD instances; match ASR_SEMAPHORE_LIMIT
     
     # WebSocket settings
+    WS_MAX_CONNECTIONS: int = 200   # hard cap on concurrent WebSocket sessions
     WS_MAX_QUEUE_SIZE: int = 100
     WS_PING_INTERVAL: int = 20
     WS_PING_TIMEOUT: int = 20

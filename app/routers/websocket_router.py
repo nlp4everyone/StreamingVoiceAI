@@ -3,6 +3,7 @@ import numpy as np
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from typing import Dict
 from app import startup
+from app.core.config import settings
 from app.utils.logger import setup_logger
 
 logger = setup_logger("Log")
@@ -22,6 +23,13 @@ async def websocket_stream(websocket: WebSocket):
     - Error: {"type": "error", "message": "..."}
     - SessionInfo: {"type": "session_info", "session_id": "...", "status": "..."}
     """
+    # Reject early if the server is at capacity — before allocating any state.
+    # accept() is required by the WebSocket protocol before sending a close frame.
+    if startup.connection_manager.get_connection_count() >= settings.WS_MAX_CONNECTIONS:
+        await websocket.accept()
+        await websocket.close(code=1013, reason="server_full")
+        return
+
     # Step 1: Create a new session and register the WebSocket connection
     session = startup.session_service.create_session()
     session_id = session.session_id
