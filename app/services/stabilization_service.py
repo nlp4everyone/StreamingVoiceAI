@@ -1,48 +1,51 @@
 from typing import List
-from app.stabilization.stabilizer import TranscriptStabilizer
+from app.stabilization.base import BaseStabilizer
 from app.utils.logger import setup_logger
 
 logger = setup_logger("StabilizationService")
 
+
 class StabilizationService:
-    """Service for transcript stabilization."""
-    
-    def __init__(self):
-        self.stabilizer = TranscriptStabilizer()
-    
-    def stabilize(self,
-                  new_hypothesis: str,
-                  previous_text: str = "") -> str:
+    """
+    Stateless coordination layer for transcript stabilization.
+
+    Stabilizers are per-session objects (stored on TranscriptState) so this
+    service never holds mutable state of its own — it delegates every call to
+    the stabilizer the caller supplies.  Swap the stabilizer by passing a
+    different BaseStabilizer subclass to TranscriptState; this service
+    requires no changes.
+    """
+
+    def stabilize(self, stabilizer: BaseStabilizer, new_hypothesis: str) -> str:
         """
-        Stabilize a new transcript hypothesis.
+        Stabilize a new hypothesis using the provided per-session stabilizer.
 
         Args:
-            new_hypothesis: New transcript hypothesis
-            previous_text: Previous stabilized text
+            stabilizer:     The session's own stabilizer instance.
+            new_hypothesis: Latest rolling hypothesis from the ASR engine.
 
         Returns:
-            Stabilized transcript
+            Stabilized transcript string.
         """
-        result = self.stabilizer.stabilize(new_hypothesis, previous_text)
-        logger.debug(f"Stabilize: '{new_hypothesis}' -> '{result}'")
+        result = stabilizer.stabilize(new_hypothesis)
+        logger.debug("Stabilize: '%s' -> '%s'", new_hypothesis, result)
         return result
 
-    def get_stable_prefix(self,
-                          hypotheses: List[str]) -> str:
+    def get_stable_prefix(self, hypotheses: List[str]) -> str:
         """
-        Get stable prefix from multiple hypotheses.
+        Return the longest prefix shared by all hypotheses in the list.
+
+        Stateless utility — does not depend on a session stabilizer.  Useful
+        when the caller has collected several consecutive engine outputs and
+        wants the portion stable across all of them.
 
         Args:
-            hypotheses: List of transcript hypotheses
+            hypotheses: Ordered list of transcript hypotheses.
 
         Returns:
-            Stable prefix common to all hypotheses
+            Shared stable prefix; empty string if none.
         """
-        prefix = self.stabilizer.get_stable_prefix(hypotheses)
-        logger.debug(f"Stable prefix from {len(hypotheses)} hypotheses: '{prefix}'")
+        from app.stabilization.stabilizer import TranscriptStabilizer
+        prefix = TranscriptStabilizer().get_stable_prefix(hypotheses)
+        logger.debug("Stable prefix from %d hypotheses: '%s'", len(hypotheses), prefix)
         return prefix
-
-    def reset(self) -> None:
-        """Reset stabilizer state."""
-        logger.info("Stabilizer state reset")
-        self.stabilizer.reset()

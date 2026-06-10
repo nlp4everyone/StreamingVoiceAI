@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     INFERENCE_QUEUE_MAXSIZE: int = 3    # per-session queue depth; excess windows are dropped
     VAD_POOL_SIZE: int = 8              # number of parallel VAD instances; match ASR_SEMAPHORE_LIMIT
     
+    # Stabilizer settings
+    STABILIZER_STRATEGY: str = "hard_length"  # frozen_prefix | hard_length | hard_then_frozen
+    STABILIZER_MODE: str = "word_level"          # word_level | character_level
+    STABILIZER_FREEZE_THRESHOLD: int = 3         # consecutive agreements before freezing (frozen_prefix only)
+
     # WebSocket settings
     WS_MAX_CONNECTIONS: int = 200   # hard cap on concurrent WebSocket sessions
     WS_MAX_QUEUE_SIZE: int = 100

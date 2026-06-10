@@ -276,8 +276,8 @@ class StreamingHandler:
 
             if transcript:
                 stabilized = self.stabilization_service.stabilize(
+                    session.transcript_state.stabilizer,
                     transcript,
-                    session.transcript_state.partial_transcript
                 )
 
                 if stabilized.strip() != session.transcript_state.partial_transcript.strip():

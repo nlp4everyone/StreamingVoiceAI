@@ -5,6 +5,7 @@ from typing import Optional
 from datetime import datetime
 from app.audio.buffer import RingAudioBuffer
 from app.core.config import settings
+from app.stabilization.factory import create_stabilizer
 
 
 class VADState:
@@ -47,37 +48,32 @@ class VADState:
 
 class TranscriptState:
     """Accumulates rolling partial hypotheses and promotes them to a final transcript on silence."""
-    
-    def __init__(self):
+
+    def __init__(self) -> None:
         self.partial_transcript = ""
         self.final_transcript = ""
-        self.stable_prefix = ""
-        self.unstable_suffix = ""
-        self.hypothesis_history = []
-        self.max_history_size = 10
-    
-    def update_partial(self, new_hypothesis: str) -> None:
-        """Replace the current partial with a stabilized hypothesis and append it to the rolling history."""
-        self.hypothesis_history.append(new_hypothesis)
-        if len(self.hypothesis_history) > self.max_history_size:
-            self.hypothesis_history.pop(0)
-        
-        self.partial_transcript = new_hypothesis
-    
+        # Per-session stabilizer — each session owns its own frozen-prefix state
+        # so sessions never share hypothesis history or frozen regions.
+        self.stabilizer = create_stabilizer()
+
+    def update_partial(self, stabilized_text: str) -> None:
+        """Store the latest stabilized hypothesis as the current partial transcript."""
+        self.partial_transcript = stabilized_text
+
     def finalize(self) -> None:
         """Promote partial_transcript into final_transcript; triggered when VAD detects end of speech."""
         if self.partial_transcript:
             self.final_transcript += " " + self.partial_transcript.strip()
             self.partial_transcript = ""
-            self.hypothesis_history.clear()
-    
+            # Reset stabilizer so the frozen prefix from this utterance
+            # does not carry over into the next one.
+            self.stabilizer.reset()
+
     def reset(self) -> None:
         """Discard all transcript state; called on 'start' control message."""
         self.partial_transcript = ""
         self.final_transcript = ""
-        self.stable_prefix = ""
-        self.unstable_suffix = ""
-        self.hypothesis_history.clear()
+        self.stabilizer.reset()
 
 
 class StreamingSession:
