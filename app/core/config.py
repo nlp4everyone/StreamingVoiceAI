@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     INTRA_SILENCE_COMMIT_ENABLED: bool = True
     INTRA_SILENCE_MS: int = 300  # pause threshold; must be < SILENCE_THRESHOLD_MS
 
+    # Right-finalize padding — dedicated final ASR pass with precise speech boundaries
+    FINALIZE_RIGHT_PADDING_ENABLED: bool = True
+    FINALIZE_RIGHT_PADDING_MS: int = 200  # right padding after last_speech_time; keep <= SPEECH_PADDING_MS
+
     STABILIZER_STRATEGY: str = "frozen_prefix"  # frozen_prefix | hard_length | edit_distance | n_consecutive | hard_then_frozen
     STABILIZER_MODE: str = "word_level"          # word_level | character_level
     STABILIZER_FREEZE_THRESHOLD: int = 3         # frozen_prefix, hard_then_frozen: agreements before freezing

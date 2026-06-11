@@ -118,13 +118,7 @@ class StreamingHandler:
         logger.info(f"[{session_id}] Control action: '{action}'")
 
         if action == "stop":
-            if session.transcript_state.partial_transcript:
-                session.transcript_state.finalize()
-                final_text = session.transcript_state.final_transcript.strip()
-                logger.info(f"[{session_id}] Finalized on stop: '{final_text}'")
-                await self.connection_manager.send_transcript(
-                    session.session_id, final_text, is_final=True
-                )
+            await self._finalize_transcript(session)
 
         elif action == "start":
             # Reset audio + transcript state and drain stale queue items.
@@ -145,13 +139,7 @@ class StreamingHandler:
             # Cancel the worker first so it doesn't race with teardown.
             await self._stop_inference_worker(session)
 
-            if session.transcript_state.partial_transcript:
-                session.transcript_state.finalize()
-                final_text = session.transcript_state.final_transcript.strip()
-                logger.info(f"[{session_id}] Finalized on cleanup: '{final_text}'")
-                await self.connection_manager.send_transcript(
-                    session.session_id, final_text, is_final=True
-                )
+            await self._finalize_transcript(session)
 
         self.session_manager.remove_session(session_id)
         self.connection_manager.disconnect(session_id)
@@ -160,6 +148,63 @@ class StreamingHandler:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _extract_final_window(self, session: StreamingSession) -> np.ndarray:
+        """
+        Extract audio spanning the complete utterance with precise boundaries:
+        [speech_start_time - SPEECH_PADDING_MS, last_speech_time + FINALIZE_RIGHT_PADDING_MS].
+
+        Returns an empty array when timing info is unavailable or the segment
+        has been evicted from the ring buffer.
+        """
+        vad = session.vad_state
+        if not vad.last_speech_time or not vad.speech_start_time:
+            return np.array([], dtype=np.int16)
+
+        now = datetime.now()
+        right_pad_s = settings.FINALIZE_RIGHT_PADDING_MS / 1000
+        left_pad_s  = settings.SPEECH_PADDING_MS / 1000
+
+        # get_range(start_ago, end_ago): start_ago > end_ago (start is further back)
+        end_ago   = max(0.0, (now - vad.last_speech_time).total_seconds() - right_pad_s)
+        start_ago = (now - vad.speech_start_time).total_seconds() + left_pad_s
+
+        if start_ago <= end_ago:
+            return np.array([], dtype=np.int16)
+
+        return session.audio_buffer.get_range(start_ago, end_ago)
+
+    async def _finalize_transcript(self, session: StreamingSession) -> None:
+        """
+        Finalize the current partial transcript and send it as the final result.
+
+        When FINALIZE_RIGHT_PADDING_ENABLED is True, runs one dedicated ASR
+        pass over the complete utterance (speech_start → last_speech_time +
+        FINALIZE_RIGHT_PADDING_MS) before committing.  Falls back silently to
+        the existing partial if extraction fails or ASR returns empty.
+
+        Safe to call even when partial_transcript is empty — becomes a no-op.
+        """
+        if not session.transcript_state.partial_transcript:
+            return
+
+        if settings.FINALIZE_RIGHT_PADDING_ENABLED:
+            audio = self._extract_final_window(session)
+            if len(audio) > 0:
+                transcript = await self.transcription_service.atranscribe(audio)
+                if transcript:
+                    logger.debug(
+                        "[%s] Right-finalize ASR result: '%s'",
+                        session.session_id, transcript,
+                    )
+                    session.transcript_state.update_partial(transcript)
+
+        session.transcript_state.finalize()
+        final_text = session.transcript_state.final_transcript.strip()
+        logger.info("[%s] Final transcript: '%s'", session.session_id, final_text)
+        await self.connection_manager.send_transcript(
+            session.session_id, final_text, is_final=True
+        )
 
     async def _handle_intra_commit(self, session: StreamingSession) -> None:
         """
@@ -320,10 +365,5 @@ class StreamingHandler:
             else:
                 logger.debug(f"[{session.session_id}] ASR returned empty transcript")
 
-        if not session.vad_state.is_speaking and session.transcript_state.partial_transcript:
-            session.transcript_state.finalize()
-            final_text = session.transcript_state.final_transcript.strip()
-            logger.info(f"[{session.session_id}] Final transcript: '{final_text}'")
-            await self.connection_manager.send_transcript(
-                session.session_id, final_text, is_final=True
-            )
+        if not session.vad_state.is_speaking:
+            await self._finalize_transcript(session)
