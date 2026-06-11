@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     VAD_POOL_SIZE: int = 8              # number of parallel VAD instances; match ASR_SEMAPHORE_LIMIT
     
     # Stabilizer settings
+    # Intra-utterance silence commit — commit mid-sentence on short pauses
+    INTRA_SILENCE_COMMIT_ENABLED: bool = True
+    INTRA_SILENCE_MS: int = 300  # pause threshold; must be < SILENCE_THRESHOLD_MS
+
     STABILIZER_STRATEGY: str = "frozen_prefix"  # frozen_prefix | hard_length | edit_distance | n_consecutive | hard_then_frozen
     STABILIZER_MODE: str = "word_level"          # word_level | character_level
     STABILIZER_FREEZE_THRESHOLD: int = 3         # frozen_prefix, hard_then_frozen: agreements before freezing

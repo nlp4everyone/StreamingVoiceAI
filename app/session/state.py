@@ -17,7 +17,10 @@ class VADState:
         self.speech_end_time: Optional[datetime] = None
         self.last_speech_time: Optional[datetime] = None
         self.silence_duration_ms = 0
-    
+        # True after an intra-utterance commit fires for the current pause so
+        # the same pause does not trigger a second commit on the next frame.
+        self.intra_committed: bool = False
+
     def update(self,
                is_speech: bool,
                current_time: datetime) -> None:
@@ -28,6 +31,7 @@ class VADState:
                 self.speech_start_time = current_time
             self.last_speech_time = current_time
             self.silence_duration_ms = 0
+            self.intra_committed = False  # reset on speech resume so next pause can trigger
         else:
             if self.is_speaking and self.last_speech_time is not None:
                 self.silence_duration_ms = (
@@ -36,7 +40,7 @@ class VADState:
                 if self.silence_duration_ms >= settings.SILENCE_THRESHOLD_MS:
                     self.is_speaking = False
                     self.speech_end_time = current_time
-    
+
     def reset(self) -> None:
         """Clear all VAD state; called on 'start' control message or session teardown."""
         self.is_speaking = False
@@ -44,6 +48,7 @@ class VADState:
         self.speech_end_time = None
         self.last_speech_time = None
         self.silence_duration_ms = 0
+        self.intra_committed = False
 
 
 class TranscriptState:

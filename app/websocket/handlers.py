@@ -161,6 +161,34 @@ class StreamingHandler:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    async def _handle_intra_commit(self, session: StreamingSession) -> None:
+        """
+        Commit the current partial transcript when a mid-utterance pause is
+        detected, without ending the utterance.
+
+        Fires once per pause event (guarded by vad_state.intra_committed) when:
+          - still inside an utterance (is_speaking=True)
+          - silence has exceeded INTRA_SILENCE_MS but not SILENCE_THRESHOLD_MS
+          - there is a partial transcript to commit
+        """
+        vad = session.vad_state
+        if (
+            vad.is_speaking
+            and vad.silence_duration_ms >= settings.INTRA_SILENCE_MS
+            and not vad.intra_committed
+            and session.transcript_state.partial_transcript
+        ):
+            vad.intra_committed = True
+            session.transcript_state.finalize()
+            committed_text = session.transcript_state.final_transcript.strip()
+            logger.info(
+                "[%s] Intra-utterance commit at %.0f ms pause: '%s'",
+                session.session_id, vad.silence_duration_ms, committed_text,
+            )
+            await self.connection_manager.send_transcript(
+                session.session_id, committed_text, is_final=True
+            )
+
     async def _stop_inference_worker(self, session: StreamingSession) -> None:
         """Cancel and await the inference worker task for a clean shutdown."""
         task = session.inference_task
@@ -264,6 +292,9 @@ class StreamingHandler:
             logger.info(f"[{session.session_id}] Speech ended")
 
         logger.debug(f"[{session.session_id}] VAD: is_speech={is_speech} is_speaking={session.vad_state.is_speaking}")
+
+        if settings.INTRA_SILENCE_COMMIT_ENABLED:
+            await self._handle_intra_commit(session)
 
         if is_speech or session.vad_state.is_speaking:
             audio_to_transcribe = self._trim_to_speech(audio_window, probs)
