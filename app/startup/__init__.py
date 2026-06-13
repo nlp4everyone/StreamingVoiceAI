@@ -114,12 +114,37 @@ async def startup() -> None:
 
 async def shutdown() -> None:
     logger.info("Shutting down services...")
+
     if _cleanup_task and not _cleanup_task.done():
         _cleanup_task.cancel()
         try:
             await _cleanup_task
         except asyncio.CancelledError:
             pass
+
+    if streaming_handler and session_manager:
+        active_sessions = list(session_manager.sessions.values())
+        if active_sessions:
+            logger.info(f"Graceful shutdown: finalizing {len(active_sessions)} active session(s)...")
+            # Stop workers first so no new partials arrive while we finalize.
+            await asyncio.gather(
+                *(streaming_handler._stop_inference_worker(s) for s in active_sessions),
+                return_exceptions=True,
+            )
+            # Send each session's current partial as a final transcript.
+            # Timeout slightly above ASR_REQUEST_TIMEOUT so the final ASR pass
+            # (FINALIZE_RIGHT_PADDING_ENABLED) has time to complete.
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *(streaming_handler._finalize_transcript(s) for s in active_sessions),
+                        return_exceptions=True,
+                    ),
+                    timeout=15.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Graceful shutdown: finalize timed out — some transcripts may be incomplete")
+
     if streaming_handler:
         await streaming_handler.transcription_service.aclose()
     if vad_executor:
