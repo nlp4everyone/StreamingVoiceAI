@@ -43,8 +43,8 @@ FastAPI WebSocket Gateway  (/ws/stream)
                 ▼
         StreamingSession  (per-session state)
                 ├── RingAudioBuffer  (12s ring buffer, pre-allocated np.int16)
-                ├── VADState         (speaking / silence tracking)
-                ├── TranscriptState  (partial / final transcript)
+                ├── VADState         (speaking / silence / intra-commit tracking)
+                ├── TranscriptState  (partial / final transcript + per-session stabilizer)
                 └── inference_queue  (asyncio.Queue, maxsize=INFERENCE_QUEUE_MAXSIZE)
                 │
                 │  handle_audio_packet() enqueues audio_snapshot every 400 ms
@@ -63,6 +63,11 @@ FastAPI WebSocket Gateway  (/ws/stream)
                 │       release instance back to pool
                 │         └── VADTriggerStrategies
                 │               (consecutive_frames | ema_smoothed | state_machine)
+                │
+                ├──▶ _handle_intra_commit()   [if INTRA_SILENCE_COMMIT_ENABLED]
+                │       fires once per pause when: is_speaking=True AND
+                │       silence_duration >= INTRA_SILENCE_MS AND not intra_committed
+                │       → TranscriptState.finalize() + send_transcript(is_final=True)
                 │
                 │  if speech detected (decision OR vad_state.is_speaking)
                 ▼
@@ -84,14 +89,36 @@ FastAPI WebSocket Gateway  (/ws/stream)
                 │
                 │  only if stabilized text differs from previous partial
                 ▼
-        StabilizationService.stabilize(new_hypothesis, previous_partial)
-          └── TranscriptStabilizer  (word-level LCP, default for Vietnamese)
-                │
+        StabilizationService.stabilize(session.stabilizer, new_hypothesis)
+          └── BaseStabilizer  (per-session, created by factory.create_stabilizer())
+                │  strategies: frozen_prefix | hard_length | edit_distance |
+                │               n_consecutive | hard_then_frozen
+                │  mode: word_level (default) | character_level
                 ▼
         ConnectionManager.send_transcript()
                 │
                 ▼
 Client  ← {"type": "transcript", "text": "...", "is_final": false|true}
+
+        │
+        │  if NOT vad_state.is_speaking AND partial_transcript exists
+        ▼
+        StreamingHandler._finalize_transcript()
+                │  if FINALIZE_RIGHT_PADDING_ENABLED:
+                │      _extract_final_window()   ← precise window:
+                │          [speech_start - SPEECH_PADDING_MS,
+                │           last_speech_time + FINALIZE_RIGHT_PADDING_MS]
+                │      atranscribe(final_window)  ← dedicated ASR pass
+                │      overrides partial if result non-empty
+                │  TranscriptState.finalize()
+                └── send_transcript(is_final=True)
+
+App Shutdown  (SIGTERM / lifespan exit)
+        ├── cancel idle-cleanup task
+        ├── _stop_inference_worker()  ×  all active sessions   (parallel)
+        ├── _finalize_transcript()   ×  all active sessions   (parallel, 15 s timeout)
+        ├── TranscriptionService.aclose()   ← close shared aiohttp session
+        └── vad_executor.shutdown()
 ```
 
 ---
@@ -157,6 +184,16 @@ Client  ← {"type": "transcript", "text": "...", "is_final": false|true}
     │   VADState.update(decision, now)
     │       silence_duration >= SILENCE_THRESHOLD_MS (700 ms)  →  is_speaking = False
     │
+    ├─ _handle_intra_commit()   [if INTRA_SILENCE_COMMIT_ENABLED=True]
+    │       fires when: is_speaking=True
+    │                   AND silence_duration_ms >= INTRA_SILENCE_MS (300 ms)
+    │                   AND NOT vad_state.intra_committed        ← once per pause
+    │                   AND partial_transcript non-empty
+    │       → vad_state.intra_committed = True
+    │       → TranscriptState.finalize()
+    │       → send_transcript(is_final=True)   ← mid-sentence segment committed
+    │       intra_committed resets to False on next speech frame
+    │
     │   if NOT (decision OR vad_state.is_speaking):
     │       skip STT  ──────────────────────────────────────────────────────┐
     │                                                                        │
@@ -177,16 +214,26 @@ Client  ← {"type": "transcript", "text": "...", "is_final": false|true}
     │           total_timeout=ASR_REQUEST_TIMEOUT (10 s)                     │
     │           response["text"]                                             │
     │                                                                        │
+    ├─ StabilizationService.stabilize(session.stabilizer, new_hypothesis)   │
+    │       delegates to per-session BaseStabilizer                          │
+    │       strategy selected at session creation via create_stabilizer()    │
+    │       stabilizer.reset() called after each utterance finalize          │
+    │                                                                        │
     ├─ if stabilized != previous_partial:                                    │
-    │       StabilizationService.stabilize(new_hypothesis, prev_partial)     │
-    │           TranscriptStabilizer.word_level_lcp()                        │
-    │           → stable prefix + updated suffix (only changed text sent)   │
     │       TranscriptState.update_partial(stabilized)                      │
     │       ConnectionManager.send_transcript(is_final=False)                │
     │                                               ◄────────────────────────┘
     └─ if NOT vad_state.is_speaking AND partial_transcript exists:
-            TranscriptState.finalize()
-            ConnectionManager.send_transcript(is_final=True)
+            _finalize_transcript()
+                if FINALIZE_RIGHT_PADDING_ENABLED=True:
+                    _extract_final_window()
+                        end_ago   = now − last_speech_time − FINALIZE_RIGHT_PADDING_MS
+                        start_ago = now − speech_start_time + SPEECH_PADDING_MS
+                        RingAudioBuffer.get_range(start_ago, end_ago)
+                    atranscribe(final_window)   ← dedicated ASR pass, precise boundaries
+                    overrides partial if result non-empty
+                TranscriptState.finalize()       ← partial → final; stabilizer.reset()
+                send_transcript(is_final=True)
     │
     ▼
 ⑤ Disconnect / idle-timeout / cleanup
@@ -194,9 +241,19 @@ Client  ← {"type": "transcript", "text": "...", "is_final": false|true}
     or unhandled server error
     →  StreamingHandler.cleanup_session()
             _stop_inference_worker()    cancel + await task
-            flush pending partial as final (if any)
+            _finalize_transcript()      flush pending partial as final (if any)
             SessionManager.remove_session()
             ConnectionManager.disconnect()
+
+⑥ Graceful shutdown  (SIGTERM / docker stop / deploy)
+    startup.shutdown()
+        cancel idle-cleanup task
+        for each active session (parallel):
+            _stop_inference_worker()    ← stop first; no new partials during finalize
+        for each active session (parallel, 15 s timeout):
+            _finalize_transcript()      ← send pending partial as final to all clients
+        TranscriptionService.aclose()  ← close shared aiohttp ClientSession
+        vad_executor.shutdown()
 ```
 
 Inference windows overlap to preserve speech context across packet boundaries:
@@ -243,7 +300,7 @@ t=0.8s  [0.8s → 6.8s]
 | `GET` | `/` | Serve static web client (`static/index.html`) |
 | `GET` | `/static/*` | Static assets (CSS, JS) |
 | `WS` | `/ws/stream` | Streaming audio endpoint |
-| `GET` | `/api/health` | Health check (active sessions + connections) |
+| `GET` | `/health` | Health check (active sessions + connections) |
 
 ---
 
@@ -263,8 +320,11 @@ Entry point for all WebSocket connections. Responsibilities:
 Per-packet orchestration — the main processing pipeline:
 - `handle_audio_packet()` — appends to buffer, snapshots audio window every 400ms and enqueues to the session's `inference_queue`; sends `backpressure` if queue is full
 - `start_inference_worker()` — spawns a background `asyncio.Task` per session that drains `inference_queue` under the global `inference_semaphore`
-- `_run_inference()` — acquires a VAD instance from the pool → VAD → trim → STT → stabilize → send; sends `backpressure` if VAD pool is exhausted
+- `_run_inference()` — acquires VAD → intra-commit check → trim → STT → stabilize → send; sends `backpressure` if VAD pool is exhausted
+- `_handle_intra_commit()` — commits the current partial as final on mid-utterance pauses (`INTRA_SILENCE_MS`); fires once per pause (guarded by `vad_state.intra_committed`)
 - `_trim_to_speech(audio_window, probs)` — crops the 6s inference window to the detected speech region + padding using frame probs already computed by `is_speech()`, avoiding a second ONNX pass
+- `_extract_final_window()` — extracts a precisely-bounded audio slice `[speech_start − SPEECH_PADDING_MS, last_speech_time + FINALIZE_RIGHT_PADDING_MS]` from the ring buffer for the final ASR pass
+- `_finalize_transcript()` — optionally runs a dedicated final ASR pass over the precise speech window, then promotes the partial to final and sends `is_final=True`
 - `handle_control_message()` — `start` resets state; `stop` flushes pending partial as final
 - `cleanup_session()` — stops inference worker, flushes pending partial, removes session
 
@@ -284,8 +344,12 @@ Pydantic models for all message types:
 ## Session Management (`app/session/`)
 
 - `state.py` — `StreamingSession`: owns `RingAudioBuffer`, `VADState`, `TranscriptState`; tracks `last_inference_time`, `inference_count`, `last_activity`
-- `manager.py` — `SessionManager`: session registry (create / get / remove)
+- `manager.py` — `SessionManager`: session registry (create / get / remove); singleton
 - `context.py` — session context helpers
+
+`VADState` tracks `is_speaking`, `speech_start_time`, `last_speech_time`, `silence_duration_ms`, and `intra_committed` (prevents duplicate intra-utterance commits per pause).
+
+`TranscriptState` owns a **per-session `BaseStabilizer`** instance (created by `create_stabilizer()` at session construction). Calling `finalize()` promotes `partial_transcript` to `final_transcript` and calls `stabilizer.reset()` so frozen state from this utterance does not bleed into the next.
 
 ## Ring Buffer (`app/audio/buffer.py`)
 
@@ -293,7 +357,7 @@ Each session holds up to 12 seconds of PCM samples in a pre-allocated `np.int16`
 
 - `append(audio)` — push new samples using numpy slice writes; wraps around automatically, evicting oldest
 - `get_latest(seconds)` — extract the most-recent N seconds as a contiguous int16 ndarray (O(N) copy, no Python loops)
-- `get_range(start_s, end_s)` — extract a specific time slice
+- `get_range(start_s, end_s)` — extract a specific time slice; used by `_extract_final_window()` for precise speech boundary extraction
 - `clear()` — reset write pointer and count without reallocating
 
 ## Silero VAD (`app/vad/`)
@@ -345,20 +409,40 @@ The inference server runs separately (NeMo / Ray).
 
 ## Transcript Stabilization (`app/stabilization/`)
 
-`TranscriptStabilizer` smooths unstable streaming ASR output using longest common prefix (LCP).
+Smooths unstable streaming ASR output using a two-layer architecture:
 
-**Two modes:**
+**Layer 1 — LCP (Longest Common Prefix)**
+
+`TranscriptStabilizer` (`stabilizer.py`) uses LCP to anchor the stable prefix across consecutive hypotheses. Two modes:
 
 | Mode | When to use |
 |---|---|
 | `word_level` (default) | Vietnamese and other space-delimited scripts |
 | `character_level` | Latin-script languages needing finer precision |
 
+**Layer 2 — Rollback Suppression**
+
+`BaseStabilizer` (`base.py`) defines the interface for all rollback suppression strategies. Each is a per-session stateful object; `StabilizationService` is stateless and just delegates.
+
+| Strategy | Mechanism | Config |
+|---|---|---|
+| `frozen_prefix` **(default)** | Progressively freezes a prefix once N consecutive hypotheses agree; rejects any hypothesis that contradicts the frozen region | `STABILIZER_FREEZE_THRESHOLD` |
+| `hard_length` | Monotonic word-count guard — transcript length can only grow, never shrink | — |
+| `edit_distance` | Rejects hypotheses that deviate more than N word edits from the last accepted output | `STABILIZER_MAX_EDIT_DISTANCE` |
+| `n_consecutive` | Accepts rollbacks only after N consecutive frames all show the shorter hypothesis | `STABILIZER_N_CONSECUTIVE` |
+| `hard_then_frozen` | Pipeline: `hard_length` gate → `frozen_prefix` commit | `STABILIZER_FREEZE_THRESHOLD` |
+
+`StabilizerPipeline` chains multiple strategies left-to-right when `hard_then_frozen` is selected.
+
+`create_stabilizer()` (`factory.py`) reads `STABILIZER_STRATEGY` and instantiates the correct class — adding a new strategy requires only a new file and a factory entry.
+
+Each session owns its stabilizer via `TranscriptState.stabilizer`; `stabilizer.reset()` is called after every `finalize()` so frozen state does not carry over between utterances.
+
 ```text
 hypothesis 1:  xin chào
 hypothesis 2:  xin chào m
 hypothesis 3:  xin chào mọi
-hypothesis 4:  xin chào một      ← correction
+hypothesis 4:  xin chào một      ← rollback → suppressed by frozen_prefix
 hypothesis 5:  xin chào mọi người
 ```
 
@@ -379,8 +463,12 @@ previous partial — suppressing no-op updates.
 | `RING_BUFFER_SECONDS` | 12 | Max audio retained per session (pre-allocated np.int16 ring buffer) |
 | `INFERENCE_INTERVAL_MS` | 400 | How often VAD+STT runs |
 | `INFERENCE_WINDOW_SECONDS` | 6 | Audio window fed to STT |
-| `SILENCE_THRESHOLD_MS` | 700 | Silence before finalize |
+| `SILENCE_THRESHOLD_MS` | 700 | Silence before utterance finalize |
 | `SPEECH_PADDING_MS` | 200 | Context padding around speech region before ASR |
+| `INTRA_SILENCE_COMMIT_ENABLED` | `true` | Commit partial as final on mid-utterance pauses |
+| `INTRA_SILENCE_MS` | 300 | Pause duration to trigger intra-utterance commit; must be < `SILENCE_THRESHOLD_MS` |
+| `FINALIZE_RIGHT_PADDING_ENABLED` | `true` | Run a dedicated final ASR pass with precise speech boundaries on utterance end |
+| `FINALIZE_RIGHT_PADDING_MS` | 200 | Right padding after `last_speech_time` in the final ASR window; keep ≤ `SPEECH_PADDING_MS` |
 | `VAD_THRESHOLD` | 0.6 | Silero speech probability cutoff (`ema_smoothed` / `consecutive_frames`) |
 | `VAD_ONSET_THRESHOLD` | 0.65 | Prob to **enter** speaking state (`state_machine` strategy) |
 | `VAD_OFFSET_THRESHOLD` | 0.40 | Prob to **exit** speaking state — hysteresis band = [0.40, 0.65] |
@@ -390,16 +478,21 @@ previous partial — suppressing no-op updates.
 | `VAD_POOL_SIZE` | 8 | Number of parallel VAD instances in the async pool |
 | `VAD_MODEL_PATH` | `/app/models/silero_vad.onnx` | Path to the Silero VAD ONNX model |
 | `VAD_USE_INT8` | `false` | Quantize FP32 → INT8 on first startup (`_int8.onnx` cached on disk) |
+| `STABILIZER_STRATEGY` | `frozen_prefix` | Rollback suppression strategy (`frozen_prefix` \| `hard_length` \| `edit_distance` \| `n_consecutive` \| `hard_then_frozen`) |
+| `STABILIZER_MODE` | `word_level` | LCP granularity (`word_level` \| `character_level`) |
+| `STABILIZER_FREEZE_THRESHOLD` | 3 | Consecutive agreements before freezing a prefix (`frozen_prefix`, `hard_then_frozen`) |
+| `STABILIZER_MAX_EDIT_DISTANCE` | 2 | Max word edits allowed vs last output (`edit_distance`) |
+| `STABILIZER_N_CONSECUTIVE` | 3 | Frames required to confirm a rollback (`n_consecutive`) |
 | `NEMO_API_URL` | `http://172.17.0.1:8005/v1/audio/transcriptions` | NeMo server endpoint |
 | `NEMO_MODEL` | `nvidia/parakeet-ctc-0.6b-vi` | Model identifier |
 | `ASR_SEMAPHORE_LIMIT` | 8 | Max concurrent NeMo HTTP requests across all sessions |
 | `INFERENCE_QUEUE_MAXSIZE` | 3 | Per-session queue depth; excess windows are dropped |
 | `ASR_CONNECT_TIMEOUT` | 2.0 | Seconds to establish TCP connection to NeMo |
 | `ASR_REQUEST_TIMEOUT` | 10.0 | Seconds for full NeMo request (connect + transfer + response) |
-| `WS_MAX_CONNECTIONS` | `200` | Hard cap on concurrent WebSocket sessions; excess closed with code 1013 |
-| `WS_MAX_QUEUE_SIZE` | `100` | Per-connection send queue depth |
-| `WS_PING_INTERVAL` | `20` | Keepalive ping interval (s) |
-| `WS_PING_TIMEOUT` | `20` | Ping response timeout (s) |
+| `WS_MAX_CONNECTIONS` | 200 | Hard cap on concurrent WebSocket sessions; excess closed with code 1013 |
+| `WS_MAX_QUEUE_SIZE` | 100 | Per-connection send queue depth |
+| `WS_PING_INTERVAL` | 20 | Keepalive ping interval (s) |
+| `WS_PING_TIMEOUT` | 20 | Ping response timeout (s) |
 | `HOST` | `0.0.0.0` | Server bind address |
 | `PORT` | 8000 | Server port |
 | `WORKERS` | 1 | Uvicorn worker count |
@@ -414,7 +507,8 @@ All values are overridable via environment variables or `.env`.
 app/
 ├── routers/
 │   ├── websocket_router.py    # WS endpoint + message dispatch
-│   └── health_router.py       # Health check endpoint
+│   ├── health_router.py       # GET /health endpoint
+│   └── web_router.py          # GET / → serve static index.html
 │
 ├── websocket/
 │   ├── handlers.py            # StreamingHandler — per-packet orchestration
@@ -429,7 +523,7 @@ app/
 │
 ├── session/
 │   ├── state.py               # StreamingSession, VADState, TranscriptState
-│   ├── manager.py             # SessionManager
+│   ├── manager.py             # SessionManager (singleton registry)
 │   └── context.py
 │
 ├── audio/
@@ -439,7 +533,7 @@ app/
 │   └── resampler.py
 │
 ├── vad/
-│   ├── silero_vad.py          # SileroVAD — model load, frame probs, lock
+│   ├── silero_vad.py          # SileroVAD — ONNX inference, pool-safe, frame probs
 │   └── trigger_strategies.py  # VADTriggerStrategies (3 detection modes)
 │
 ├── asr/
@@ -451,17 +545,24 @@ app/
 ├── services/
 │   ├── streaming_service.py       # Buffer append + inference timing
 │   ├── transcription_service.py   # NvidiaNemoASREngine wiring
-│   ├── stabilization_service.py   # StabilizationService wrapper
+│   ├── stabilization_service.py   # Stateless wrapper — delegates to per-session stabilizer
 │   └── session_service.py         # Session CRUD
 │
 ├── stabilization/
-│   ├── stabilizer.py              # TranscriptStabilizer (word/character LCP)
-│   └── longest_common_prefix/
-│       ├── word_level_lcp.py      # Word-level LCP (default, Vietnamese)
-│       └── character_level_lcp.py # Character-level LCP
+│   ├── base.py                    # BaseStabilizer ABC + StabilizerPipeline
+│   ├── factory.py                 # create_stabilizer() — reads STABILIZER_STRATEGY from config
+│   ├── stabilizer.py              # TranscriptStabilizer (LCP coordinator, word/character)
+│   ├── longest_common_prefix/
+│   │   ├── word_level_lcp.py      # Word-level LCP (default, Vietnamese)
+│   │   └── character_level_lcp.py # Character-level LCP
+│   └── rollback_suppression/
+│       ├── frozen_prefix_stabilizer.py   # Progressive freeze + rollback guard (default)
+│       ├── hard_length_stabilizer.py     # Monotonic word-count guard
+│       ├── edit_distance_stabilizer.py   # Word-level Levenshtein gate
+│       └── n_consecutive_stabilizer.py   # Require N frames to confirm a rollback
 │
 ├── startup/
-│   └── __init__.py            # App-level singletons + VAD pool init + idle-cleanup task
+│   └── __init__.py            # App-level singletons, VAD pool, idle-cleanup, graceful shutdown
 │
 ├── core/
 │   └── config.py              # Settings (pydantic-settings)
@@ -477,7 +578,7 @@ static/
 
 docker/
 ├── Dockerfile.web
-└── docker-compose.yml     # web + ray services
+└── docker-compose.yml     # web service with restart policy + healthcheck
 ```
 
 ---

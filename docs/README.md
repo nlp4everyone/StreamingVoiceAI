@@ -228,22 +228,24 @@ Key configuration parameters in `app/core/config.py` (all overridable via `.env`
 - [x] In-memory WAV encoding (no temp files)
 
 ### 🔄 Transcript Stabilization
-- [x] Word-level LCP stabilizer for Vietnamese
-- [x] Character-level LCP stabilizer
+- [x] LCP stabilizer — word-level (Vietnamese) and character-level modes
+- [x] Pluggable rollback suppression strategies (`frozen_prefix`, `hard_length`, `edit_distance`, `n_consecutive`, `hard_then_frozen`) with per-session state isolation
+- [x] Intra-utterance silence commit and right-finalize padding for accurate segment boundaries
 
 ### 🖥️ Web Client
 - [x] Built-in browser UI with microphone recording and live transcripts
 
 ### 🔧 Refactor / Optimization
-- [x] Pure ONNX runtime for SileroVAD (no PyTorch, ↓ 91% disk / ↓ 76% RAM)
-- [x] Preload SileroVAD at startup; bake model into Docker image layer
-- [x] Pre-allocated numpy int16 ring buffer (↓ 14× memory vs deque)
-- [x] VAD async pool + per-session inference queue (non-blocking receive loop)
-- [x] Backpressure signaling on VAD pool / queue overload
-- [x] Shared aiohttp ClientSession with configurable timeouts
-- [x] Dual-threshold hysteresis for `state_machine` VAD strategy
-- [x] Add structured logging to all main processing steps
+- [x] Pure ONNX runtime for SileroVAD — no PyTorch (↓ 91% disk / ↓ 76% RAM); model baked into Docker image layer
+- [x] Pre-allocated np.int16 ring buffer (↓ 14× memory); VAD async pool + per-session inference queue (non-blocking receive loop)
+- [x] Backpressure signaling, shared aiohttp ClientSession, structured logging
 - [ ] Split configuration file
+
+### 🛡️ Fault Tolerance
+- [x] Process supervision — Docker `restart: unless-stopped` + `healthcheck` (detects hung processes, not just crashes)
+- [x] Graceful shutdown — finalize all active sessions on SIGTERM before process exit
+- [ ] Persist finalized transcripts — append-only log or SQLite so completed transcripts survive a crash
+- [ ] Multi-worker + sticky sessions — multiple Uvicorn workers behind a load balancer with session-affinity routing to reduce blast radius per crash
 
 # 📚 Model Citation
 
