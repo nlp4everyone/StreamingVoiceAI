@@ -40,6 +40,7 @@ class VADTriggerStrategies:
         if not probs:
             return False
 
+        # Scan frames, counting the current unbroken run of speech frames.
         consecutive = 0
         for prob in probs:
             if prob > threshold:
@@ -81,13 +82,13 @@ class VADTriggerStrategies:
         if not probs:
             return False
 
-        # Seed the EMA with the first frame so the filter doesn't need a
-        # warm-up period to reach the actual signal level.
+        # 1. Seed the EMA with the first frame so the filter doesn't need a
+        #    warm-up period to reach the actual signal level.
         ema = probs[0]
         if ema > threshold:
             return True
 
-        # Process remaining frames — probs[0] is already accounted for above.
+        # 2. Slide the EMA across remaining frames; declare speech on first crossing.
         for prob in probs[1:]:
             # Blend the new observation into the running average.
             # High alpha → reacts quickly; low alpha → heavy smoothing.
@@ -136,11 +137,15 @@ class VADTriggerStrategies:
         if not probs:
             return False
 
+        # 1. Initialise the FSM — starts in silence with all counters zeroed.
+        #    was_speaking latches True on first onset so we can return True even
+        #    if the FSM ends back in silence (utterance completed within the window).
         state = "silence"
         onset_count = 0   # consecutive above-threshold frames while silent
         offset_count = 0  # consecutive below-threshold frames while speaking
-        was_speaking = False  # latches True the moment speech state is entered
+        was_speaking = False
 
+        # 2. Drive the FSM one frame at a time.
         for prob in probs:
             if state == "silence":
                 if prob > onset_threshold:
@@ -163,10 +168,10 @@ class VADTriggerStrategies:
                         onset_count = 0
                         offset_count = 0
                 else:
-                    # Above-threshold frame: still speaking, discard accumulated
-                    # offset so a brief pause doesn't end the utterance.
+                    # Above-threshold frame: still speaking; discard accumulated
+                    # offset so a brief pause doesn't end the utterance prematurely.
                     offset_count = 0
 
-        # Return whether speech was detected at any point in the window,
-        # regardless of the final state (utterance may still be ongoing).
+        # 3. Return whether speech was detected at any point in the window,
+        #    regardless of the final FSM state (utterance may still be ongoing).
         return was_speaking

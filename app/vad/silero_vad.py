@@ -80,6 +80,9 @@ class SileroVAD:
     def _resolve_model_path(self) -> str | None:
         """Return the first model path that exists, preferring INT8 over FP32 when VAD_USE_INT8 is set."""
         base = settings.VAD_MODEL_PATH
+
+        # Build candidate list: INT8 variants are prepended when VAD_USE_INT8 is set
+        # so the quantized model is preferred without requiring a separate config path.
         if settings.VAD_USE_INT8:
             candidates = (
                 [base.replace(".onnx", "_int8.onnx"), base]
@@ -88,11 +91,14 @@ class SileroVAD:
             )
         else:
             candidates = [base] + self._FALLBACK_PATHS
+
+        # Return the first path that actually exists on disk.
         for path in candidates:
             if os.path.isfile(path):
                 if "_int8" in path:
                     logger.info(f"Using INT8 quantized VAD model: {path}")
                 return path
+
         logger.error(
             f"Silero VAD ONNX model not found. Tried: {candidates}"
         )
@@ -107,26 +113,34 @@ class SileroVAD:
         Sets ``self.model`` to ``None`` on failure so callers can degrade
         gracefully instead of raising at inference time.
         """
+        # 1. Resolve model path — prefers INT8 quantized variant if VAD_USE_INT8 is set.
         path = self._resolve_model_path()
         if path is None:
             self.model = None
             return
         try:
+            # 2. Configure single-threaded execution to avoid lock contention when
+            #    multiple VAD instances run concurrently in the thread pool.
             sess_options = ort.SessionOptions()
             sess_options.intra_op_num_threads = 1
             sess_options.inter_op_num_threads = 1
             sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
             sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+            # 3. Load the ONNX model.
             self.model = ort.InferenceSession(
                 path,
                 sess_options=sess_options,
                 providers=["CPUExecutionProvider"],
             )
-            # state input: shape [2, batch=1, hidden] — derive hidden size from metadata.
+
+            # 4. Allocate GRU state buffer — shape [2, batch=1, hidden] derived from model metadata.
             state_meta = next(i for i in self.model.get_inputs() if i.name == "state")
             self._state = np.zeros(
                 (state_meta.shape[0], 1, state_meta.shape[2]), dtype=np.float32
             )
+
+            # 5. Pre-allocate input buffer [1, context + window] to avoid per-frame allocation.
             self._input_buf = np.zeros(
                 (1, self._context_size + self.window_size_samples), dtype=np.float32
             )
@@ -151,10 +165,12 @@ class SileroVAD:
             float32 numpy array in the range [-1.0, 1.0].
         """
         if audio.dtype == np.int16:
-            # Scale int16 range [-32768, 32767] → [-1.0, ~1.0]
+            # int16 range is [-32768, 32767] — divide by 32768 to map to [-1.0, ~1.0].
             return audio.astype(np.float32) / 32768.0
         if audio.dtype != np.float32:
+            # Any other numeric dtype (float64, int32, …) — cast directly.
             return audio.astype(np.float32)
+        # Already float32 — return as-is to avoid a redundant copy.
         return audio
 
     def _compute_frame_probs(self, audio: np.ndarray) -> List[float]:
@@ -313,25 +329,29 @@ class SileroVAD:
             List of ``(start_ms, end_ms)`` tuples, one per detected segment.
         """
         speech_segments = []
-        current_speech_start = None
+        current_speech_start = None  # sample index where the current segment opened
         silence_samples = 0
 
         for frame_idx, prob in enumerate(probs):
             sample_offset = frame_idx * self.window_size_samples
 
             if prob > self.threshold:
+                # Speech frame — open a new segment if not already inside one.
                 if current_speech_start is None:
                     current_speech_start = sample_offset
-                silence_samples = 0
+                silence_samples = 0  # reset silence counter on any speech frame
             else:
                 if current_speech_start is not None:
+                    # Silence frame inside an open segment — accumulate silence duration.
                     silence_samples += self.window_size_samples
                     silence_ms = (silence_samples / self.sample_rate) * 1000
 
                     if silence_ms >= min_silence_duration_ms:
+                        # Silence long enough to close the segment.
                         end_sample = sample_offset
                         speech_ms = ((end_sample - current_speech_start) / self.sample_rate) * 1000
 
+                        # Only emit segments above the minimum speech duration threshold.
                         if speech_ms >= min_speech_duration_ms:
                             start_ms = (current_speech_start / self.sample_rate) * 1000
                             end_ms = (end_sample / self.sample_rate) * 1000
@@ -340,6 +360,7 @@ class SileroVAD:
                         current_speech_start = None
                         silence_samples = 0
 
+        # Flush any segment still open at the end of the audio (no trailing silence to close it).
         if current_speech_start is not None:
             total_samples = len(probs) * self.window_size_samples
             speech_ms = ((total_samples - current_speech_start) / self.sample_rate) * 1000
@@ -375,7 +396,12 @@ class SileroVAD:
         if self.model is None:
             return []
 
+        # 1. Normalise raw PCM to float32 in [-1, 1].
         audio = self._to_float32(audio)
+
+        # 2. Run ONNX inference to get per-frame speech probabilities.
         with self._lock:
             probs = self._compute_frame_probs(audio)
+
+        # 3. Convert probabilities to (start_ms, end_ms) segments.
         return self.segments_from_probs(probs, min_speech_duration_ms, min_silence_duration_ms)
