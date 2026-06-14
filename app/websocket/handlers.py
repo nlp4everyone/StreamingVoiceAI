@@ -76,12 +76,9 @@ class StreamingHandler:
             logger.warning(f"Audio packet received for unknown session: {session_id}")
             return
 
-        # 1. Append audio to ring buffer; returns True once buffer >= INFERENCE_WINDOW_SECONDS.
-        buffer_ready = self.streaming_service.process_audio_packet(session, audio_data)
+        self.streaming_service.process_audio_packet(session, audio_data)
 
-        # 2. Both gates must pass: enough buffered audio AND enough time since last inference.
-        if buffer_ready and self.streaming_service.should_run_inference(session):
-            # 3. Snapshot the latest window and hand it off to the background worker.
+        if self.streaming_service.should_run_inference(session):
             audio_window = self.streaming_service.get_inference_window(session)
             if len(audio_window) == 0:
                 return
@@ -97,7 +94,6 @@ class StreamingHandler:
                     session_id, session.inference_count, session.audio_queue.qsize(),
                 )
             except asyncio.QueueFull:
-                # 4. Worker is falling behind — drop window and signal client if needed.
                 session.dropped_windows += 1
                 now = datetime.now()
                 if session.should_signal_backpressure(now):
@@ -122,7 +118,6 @@ class StreamingHandler:
         logger.info(f"[{session_id}] Control action: '{action}'")
 
         if action == "stop":
-            # Flush partial transcript and send final result to client.
             await self._finalize_transcript(session)
 
         elif action == "start":
@@ -141,13 +136,11 @@ class StreamingHandler:
         session = self.session_manager.get_session(session_id)
 
         if session:
-            # 1. Cancel the worker first so it doesn't race with teardown.
+            # Cancel the worker first so it doesn't race with teardown.
             await self._stop_inference_worker(session)
 
-            # 2. Flush any remaining partial transcript before removing state.
             await self._finalize_transcript(session)
 
-        # 3. Remove from registry and close the WebSocket connection.
         self.session_manager.remove_session(session_id)
         self.connection_manager.disconnect(session_id)
         logger.info(f"[{session_id}] Session cleaned up")
@@ -165,8 +158,6 @@ class StreamingHandler:
         has been evicted from the ring buffer.
         """
         vad = session.vad_state
-
-        # 1. Bail out if VAD never recorded timing boundaries for this utterance.
         if not vad.last_speech_time or not vad.speech_start_time:
             return np.array([], dtype=np.int16)
 
@@ -174,17 +165,13 @@ class StreamingHandler:
         right_pad_s = settings.FINALIZE_RIGHT_PADDING_MS / 1000
         left_pad_s  = settings.SPEECH_PADDING_MS / 1000
 
-        # 2. Convert wall-clock timestamps to "seconds ago" offsets for get_range.
-        #    end_ago is clamped to 0 so we never request audio from the future.
         # get_range(start_ago, end_ago): start_ago > end_ago (start is further back)
         end_ago   = max(0.0, (now - vad.last_speech_time).total_seconds() - right_pad_s)
         start_ago = (now - vad.speech_start_time).total_seconds() + left_pad_s
 
-        # 3. Guard against zero-length or inverted range (e.g. utterance too short).
         if start_ago <= end_ago:
             return np.array([], dtype=np.int16)
 
-        # 4. Slice the ring buffer to extract the exact utterance window.
         return session.audio_buffer.get_range(start_ago, end_ago)
 
     async def _finalize_transcript(self, session: StreamingSession) -> None:
@@ -198,12 +185,9 @@ class StreamingHandler:
 
         Safe to call even when partial_transcript is empty — becomes a no-op.
         """
-        # 1. No-op if there is nothing to finalize.
         if not session.transcript_state.partial_transcript:
             return
 
-        # 2. Optional right-padding pass: re-run ASR over the full utterance boundary
-        #    to capture words that the rolling window may have cut off at the tail.
         if settings.FINALIZE_RIGHT_PADDING_ENABLED:
             audio = self._extract_final_window(session)
             if len(audio) > 0:
@@ -213,10 +197,8 @@ class StreamingHandler:
                         "[%s] Right-finalize ASR result: '%s'",
                         session.session_id, transcript,
                     )
-                    # Overwrite partial with the more complete right-padded result.
                     session.transcript_state.update_partial(transcript)
 
-        # 3. Promote partial → final and send to client.
         session.transcript_state.finalize()
         final_text = session.transcript_state.final_transcript.strip()
         logger.info("[%s] Final transcript: '%s'", session.session_id, final_text)
@@ -235,19 +217,12 @@ class StreamingHandler:
           - there is a partial transcript to commit
         """
         vad = session.vad_state
-
-        # All four conditions must hold:
-        #   - still inside an utterance (VAD hasn't declared end-of-speech)
-        #   - silence has lasted long enough to treat as a clause boundary
-        #   - not already committed this pause (intra_committed resets on next speech)
-        #   - there is actually something to commit
         if (
             vad.is_speaking
             and vad.silence_duration_ms >= settings.INTRA_SILENCE_MS
             and not vad.intra_committed
             and session.transcript_state.partial_transcript
         ):
-            # Mark as committed so this pause only fires once even if silence continues.
             vad.intra_committed = True
             session.transcript_state.finalize()
             committed_text = session.transcript_state.final_transcript.strip()
@@ -265,7 +240,6 @@ class StreamingHandler:
         if task and not task.done():
             task.cancel()
             try:
-                # Await so cancellation completes before the caller proceeds with teardown.
                 await task
             except asyncio.CancelledError:
                 pass
@@ -284,16 +258,13 @@ class StreamingHandler:
         logger.debug(f"[{session_id}] Inference worker running")
         try:
             while True:
-                # 1. Block until handle_audio_packet enqueues a window.
                 audio_window = await session.audio_queue.get()
                 try:
-                    # 2. Acquire semaphore to cap concurrent ASR calls across all sessions.
                     async with self.inference_semaphore:
                         await self._run_inference(session, audio_window)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    # 3. Swallow per-window errors so the worker stays alive for the next window.
                     logger.error(f"[{session_id}] Inference error: {e}")
         except asyncio.CancelledError:
             logger.debug(f"[{session_id}] Inference worker cancelled")
@@ -307,11 +278,9 @@ class StreamingHandler:
         all 200 receive loops remain responsive.  VAD_POOL_SIZE instances run
         truly in parallel — no shared threading.Lock contention between them.
         """
-        # 1. Checkout a VAD instance; timeout prevents indefinite blocking when all are busy.
         try:
             vad = await asyncio.wait_for(self.vad_pool.get(), timeout=5.0)
         except asyncio.TimeoutError:
-            # All VAD instances occupied — drop this window and signal backpressure.
             session.dropped_windows += 1
             now = datetime.now()
             if session.should_signal_backpressure(now):
@@ -326,7 +295,6 @@ class StreamingHandler:
             return False, []
 
         try:
-            # 2. Run ONNX inference on a thread so the event loop stays unblocked.
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
                 self.vad_executor,
@@ -335,21 +303,17 @@ class StreamingHandler:
                 settings.VAD_TRIGGER_STRATEGY,
             )
         finally:
-            # 3. Always return the instance to the pool, even if inference raised.
             self.vad_pool.put_nowait(vad)
 
     def _trim_to_speech(self,
                         audio_window: np.ndarray,
                         probs: list) -> np.ndarray:
         """Return the sub-array of audio_window that spans detected speech."""
-        # 1. Convert per-frame VAD probabilities to (start_ms, end_ms) speech segments.
         segments = self._vad_ref.segments_from_probs(probs)
         if not segments:
             logger.debug("No speech segments detected — using full audio window")
             return audio_window
 
-        # 2. Span from the first segment start to the last segment end, with padding
-        #    on both sides to avoid clipping the first/last phoneme.
         padding = int(settings.SPEECH_PADDING_MS / 1000 * settings.SAMPLE_RATE)
         start_sample = max(0, int(segments[0][0] / 1000 * settings.SAMPLE_RATE) - padding)
         end_sample = min(len(audio_window), int(segments[-1][1] / 1000 * settings.SAMPLE_RATE) + padding)
@@ -362,12 +326,9 @@ class StreamingHandler:
         if len(audio_window) == 0:
             return
 
-        # 1. Run VAD on the audio window to detect speech activity.
         is_speech, probs = await self._run_vad(session, audio_window)
         current_time = datetime.now()
         was_speaking = session.vad_state.is_speaking
-
-        # 2. Advance VAD state machine; tracks speech_start_time / last_speech_time.
         session.vad_state.update(is_speech, current_time)
 
         if is_speech and not was_speaking:
@@ -377,14 +338,10 @@ class StreamingHandler:
 
         logger.debug(f"[{session.session_id}] VAD: is_speech={is_speech} is_speaking={session.vad_state.is_speaking}")
 
-        # 3. Commit mid-utterance segment when a long-enough pause is detected.
         if settings.INTRA_SILENCE_COMMIT_ENABLED:
             await self._handle_intra_commit(session)
 
-        # 4. Run ASR while speech is active or the utterance hasn't fully ended yet
-        #    (is_speaking stays True during short silences within an utterance).
         if is_speech or session.vad_state.is_speaking:
-            # 5. Trim window to speech boundaries to reduce noise fed to ASR.
             audio_to_transcribe = self._trim_to_speech(audio_window, probs)
             logger.debug(
                 f"[{session.session_id}] Sending {len(audio_to_transcribe)} samples to ASR "
@@ -394,13 +351,11 @@ class StreamingHandler:
             transcript = await self.transcription_service.atranscribe(audio_to_transcribe)
 
             if transcript:
-                # 6. Stabilize to suppress ASR rollbacks before emitting partial.
                 stabilized = self.stabilization_service.stabilize(
                     session.transcript_state.stabilizer,
                     transcript,
                 )
 
-                # 7. Only push update when text actually changed to avoid redundant WS messages.
                 if stabilized.strip() != session.transcript_state.partial_transcript.strip():
                     session.transcript_state.update_partial(stabilized)
                     logger.info(f"[{session.session_id}] Partial transcript: '{stabilized}'")
@@ -410,6 +365,5 @@ class StreamingHandler:
             else:
                 logger.debug(f"[{session.session_id}] ASR returned empty transcript")
 
-        # 8. Finalize utterance once VAD confirms end of speech.
         if not session.vad_state.is_speaking:
             await self._finalize_transcript(session)

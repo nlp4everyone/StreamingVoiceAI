@@ -127,14 +127,12 @@ class ConnectionManager:
             return False
 
         websocket = self.active_connections[session_id]
-        # Build the backpressure notification payload.
         message = BackpressureMessage(
             reason=reason,
             dropped_windows=dropped_windows,
             timestamp=datetime.now()
         )
 
-        # Send and disconnect the session on failure.
         try:
             await websocket.send_json(message.model_dump(mode='json'))
             return True
@@ -148,8 +146,7 @@ class ConnectionManager:
         """Broadcast a message to all active connections."""
         disconnected = []
 
-        # 1. Attempt delivery to every active connection; collect failures.
-        #    Failures are deferred — modifying active_connections mid-iteration would break the loop.
+        # Attempt delivery to every active connection
         for session_id, websocket in self.active_connections.items():
             try:
                 await websocket.send_json(message)
@@ -157,7 +154,7 @@ class ConnectionManager:
                 logger.warning(f"Error broadcasting to {session_id}: {e}")
                 disconnected.append(session_id)
 
-        # 2. Clean up sessions that failed during broadcast.
+        # Clean up sessions that failed during broadcast
         for session_id in disconnected:
             self.disconnect(session_id)
     
@@ -167,12 +164,9 @@ class ConnectionManager:
         if websocket is None:
             return
         try:
-            # code=1000 (normal closure) so the client knows this was intentional, not a crash.
-            # The close frame triggers WebSocketDisconnect in the router, which runs cleanup.
             await websocket.close(code=1000, reason="idle_timeout")
             logger.info(f"[{session_id}] Closed idle WebSocket (idle_timeout)")
         except Exception as e:
-            # Socket may already be gone if the client disconnected concurrently.
             logger.debug(f"[{session_id}] close_idle_session error (already gone?): {e}")
 
     def get_connection_count(self) -> int:
