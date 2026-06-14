@@ -4,6 +4,7 @@ aiohttp==3.13.5
 numpy==2.4.6
 pydantic==2.13.4
 pydantic_settings==2.14.1
+PyYAML==6.0.2
 uvicorn==0.47.0
 packaging==26.2
 websockets==16.0

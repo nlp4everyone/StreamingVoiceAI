@@ -1,0 +1,50 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Stable application config — algorithm parameters and processing defaults.
+# Environment-specific values (URLs, paths, ports) belong in .env instead.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Audio processing
+SAMPLE_RATE: 16000            # Hz
+AUDIO_PACKET_MS: 20           # incoming WebSocket chunk size
+RING_BUFFER_SECONDS: 12       # rolling audio buffer length
+INFERENCE_INTERVAL_MS: 400    # min gap between ASR calls
+INFERENCE_WINDOW_SECONDS: 6   # audio window sent to ASR
+SILENCE_THRESHOLD_MS: 700     # silence duration that ends an utterance
+SPEECH_PADDING_MS: 200        # extra audio around speech boundaries
+
+# VAD algorithm
+VAD_THRESHOLD: 0.6            # speech probability cutoff
+VAD_SAMPLE_RATE: 16000        # must match SAMPLE_RATE
+VAD_WINDOW_SIZE_SAMPLES: 512  # samples per frame (512 = 32 ms at 16 kHz)
+VAD_TRIGGER_STRATEGY: "ema_smoothed"  # consecutive_frames | ema_smoothed | state_machine
+VAD_ONSET_THRESHOLD: 0.65     # state_machine: threshold to enter speech
+VAD_OFFSET_THRESHOLD: 0.40    # state_machine: threshold to leave speech
+
+# ASR timeouts
+ASR_CONNECT_TIMEOUT: 2.0      # TCP connect timeout (s)
+ASR_REQUEST_TIMEOUT: 10.0     # full request timeout (s)
+INFERENCE_QUEUE_MAXSIZE: 3    # per-session queue depth; excess dropped
+
+# NeMo model name (URL goes in .env)
+NEMO_MODEL: "nvidia/parakeet-ctc-0.6b-vi"
+
+# Stabilizer
+STABILIZER_STRATEGY: "frozen_prefix"  # frozen_prefix | hard_length | edit_distance | n_consecutive | hard_then_frozen
+STABILIZER_MODE: "word_level"         # word_level | character_level
+STABILIZER_FREEZE_THRESHOLD: 3        # consecutive agreements before freezing a prefix
+STABILIZER_MAX_EDIT_DISTANCE: 2       # max word edits allowed vs last output
+STABILIZER_N_CONSECUTIVE: 3           # repetitions required to confirm a rollback
+
+# Intra-utterance silence commit
+INTRA_SILENCE_COMMIT_ENABLED: true
+INTRA_SILENCE_MS: 300                 # pause to trigger intra-commit; < SILENCE_THRESHOLD_MS
+
+# Right-finalize padding
+FINALIZE_RIGHT_PADDING_ENABLED: true
+FINALIZE_RIGHT_PADDING_MS: 200        # right padding for final pass; keep <= SPEECH_PADDING_MS
+
+# WebSocket
+WS_MAX_CONNECTIONS: 200   # max concurrent sessions
+WS_MAX_QUEUE_SIZE: 100    # outbound message queue depth
+WS_PING_INTERVAL: 20      # seconds between ping frames
+WS_PING_TIMEOUT: 20       # seconds to wait for pong

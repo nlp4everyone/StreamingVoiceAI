@@ -1,76 +1,125 @@
-from pydantic_settings import BaseSettings
-from typing import Optional
+"""
+Config loading — priority (highest → lowest):
+  1. Environment variables   (runtime overrides, Docker -e flags)
+  2. .env file               (local dev, not version-controlled)
+  3. config/settings.yaml    (stable algorithm defaults, version-controlled)
+  4. Field defaults below    (fallback so tests run without any files)
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, Type
+
+import yaml
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
+from pydantic.fields import FieldInfo
+
+# Resolve yaml path relative to project root so it works from any cwd.
+_PROJECT_ROOT = Path(__file__).parent.parent.parent
+_DEFAULT_YAML = _PROJECT_ROOT / "config" / "settings.yaml"
+
+
+class YamlSettingsSource(PydanticBaseSettingsSource):
+    """Load settings from a YAML file as the lowest-priority source."""
+
+    def __init__(self, settings_cls: Type[BaseSettings], yaml_path: Path) -> None:
+        super().__init__(settings_cls)
+        self._data: Dict[str, Any] = {}
+        if yaml_path.is_file():
+            with yaml_path.open() as f:
+                self._data = yaml.safe_load(f) or {}
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> Tuple[Any, str, bool]:
+        value = self._data.get(field_name)
+        return value, field_name, value is not None
+
+    def field_is_complex(self, field: FieldInfo) -> bool:
+        return False
+
+    def __call__(self) -> Dict[str, Any]:
+        return {k: v for k, v in self._data.items()}
 
 
 class Settings(BaseSettings):
-    """Application configuration settings."""
-    
-    # Audio settings
-    SAMPLE_RATE: int = 16000
-    AUDIO_PACKET_MS: int = 20
-    RING_BUFFER_SECONDS: int = 12
-    INFERENCE_INTERVAL_MS: int = 400
-    INFERENCE_WINDOW_SECONDS: int = 6
-    SILENCE_THRESHOLD_MS: int = 700
-    SPEECH_PADDING_MS: int = 200
-    
-    # VAD settings
-    VAD_THRESHOLD: float = 0.6
-    VAD_SAMPLE_RATE: int = 16000
-    VAD_WINDOW_SIZE_SAMPLES: int = 512
+    # ── Audio ────────────────────────────────────────────────────────────────
+    SAMPLE_RATE: int = 16000             # Hz
+    AUDIO_PACKET_MS: int = 20            # incoming WebSocket chunk size
+    RING_BUFFER_SECONDS: int = 12        # rolling audio buffer length
+    INFERENCE_INTERVAL_MS: int = 400     # min gap between ASR calls
+    INFERENCE_WINDOW_SECONDS: int = 6    # audio window sent to ASR
+    SILENCE_THRESHOLD_MS: int = 700      # silence duration that ends an utterance
+    SPEECH_PADDING_MS: int = 200         # extra audio around speech boundaries
 
-    VAD_TRIGGER_STRATEGY: str = "ema_smoothed"  # consecutive_frames | ema_smoothed | state_machine
-    VAD_MODEL_PATH: str = "/app/models/silero_vad.onnx"
-    VAD_USE_INT8: bool = False  # prefer INT8 quantized model; set False to force FP32
-    # Hysteresis thresholds for state_machine strategy.
-    # onset_threshold > offset_threshold creates a neutral band [offset, onset]
-    # where no state transition occurs, eliminating chattering near the boundary.
-    VAD_ONSET_THRESHOLD: float = 0.65   # prob must exceed this to START speaking
-    VAD_OFFSET_THRESHOLD: float = 0.40  # prob must drop below this to STOP speaking
-    
-    # STT settings
-    STT_MODEL_PATH: Optional[str] = None
-    STT_DEVICE: str = "cuda"  # or "cpu"
+    # ── VAD ──────────────────────────────────────────────────────────────────
+    VAD_THRESHOLD: float = 0.6           # speech probability cutoff
+    VAD_SAMPLE_RATE: int = 16000         # must match SAMPLE_RATE
+    VAD_WINDOW_SIZE_SAMPLES: int = 512   # samples per frame (512 = 32 ms at 16 kHz)
+    VAD_TRIGGER_STRATEGY: str = "ema_smoothed"        # consecutive_frames | ema_smoothed | state_machine
+    VAD_MODEL_PATH: str = "/app/models/silero_vad.onnx"  # override in .env for local dev
+    VAD_USE_INT8: bool = False           # prefer INT8 quantized model
+    VAD_ONSET_THRESHOLD: float = 0.65   # state_machine: threshold to enter speech
+    VAD_OFFSET_THRESHOLD: float = 0.40  # state_machine: threshold to leave speech
+
+    # ── STT / NeMo ───────────────────────────────────────────────────────────
+    STT_MODEL_PATH: Optional[str] = None          # reserved for local model loading
+    STT_DEVICE: str = "cuda"                       # cuda | cpu
     STT_BATCH_SIZE: int = 1
-
-    # NeMo ASR settings
-    NEMO_API_URL: str = "http://172.17.0.1:8005/v1/audio/transcriptions"
+    NEMO_API_URL: str = "http://localhost:8005/v1/audio/transcriptions"  # set in .env
     NEMO_MODEL: str = "nvidia/parakeet-ctc-0.6b-vi"
-    ASR_CONNECT_TIMEOUT: float = 2.0    # seconds to establish TCP connection
-    ASR_REQUEST_TIMEOUT: float = 10.0   # seconds for full request (connect + transfer + response)
-    ASR_SEMAPHORE_LIMIT: int = 8        # max concurrent NeMo HTTP requests across all sessions
-    INFERENCE_QUEUE_MAXSIZE: int = 3    # per-session queue depth; excess windows are dropped
-    VAD_POOL_SIZE: int = 8              # number of parallel VAD instances; match ASR_SEMAPHORE_LIMIT
-    
-    # Stabilizer settings
-    # Intra-utterance silence commit — commit mid-sentence on short pauses
-    INTRA_SILENCE_COMMIT_ENABLED: bool = True
-    INTRA_SILENCE_MS: int = 300  # pause threshold; must be < SILENCE_THRESHOLD_MS
+    ASR_CONNECT_TIMEOUT: float = 2.0   # TCP connect timeout (s)
+    ASR_REQUEST_TIMEOUT: float = 10.0  # full request timeout (s)
+    ASR_SEMAPHORE_LIMIT: int = 8       # max concurrent NeMo requests
+    INFERENCE_QUEUE_MAXSIZE: int = 3   # per-session queue depth; excess dropped
+    VAD_POOL_SIZE: int = 8             # parallel VAD instances; match ASR_SEMAPHORE_LIMIT
 
-    # Right-finalize padding — dedicated final ASR pass with precise speech boundaries
-    FINALIZE_RIGHT_PADDING_ENABLED: bool = True
-    FINALIZE_RIGHT_PADDING_MS: int = 200  # right padding after last_speech_time; keep <= SPEECH_PADDING_MS
-
-    STABILIZER_STRATEGY: str = "frozen_prefix"  # frozen_prefix | hard_length | edit_distance | n_consecutive | hard_then_frozen
+    # ── Stabilizer ───────────────────────────────────────────────────────────
+    INTRA_SILENCE_COMMIT_ENABLED: bool = True  # commit partial on mid-utterance pause
+    INTRA_SILENCE_MS: int = 300                # pause to trigger intra-commit; < SILENCE_THRESHOLD_MS
+    FINALIZE_RIGHT_PADDING_ENABLED: bool = True  # dedicated final ASR pass at utterance end
+    FINALIZE_RIGHT_PADDING_MS: int = 200         # right padding for final pass; keep <= SPEECH_PADDING_MS
+    STABILIZER_STRATEGY: str = "frozen_prefix"   # frozen_prefix | hard_length | edit_distance | n_consecutive | hard_then_frozen
     STABILIZER_MODE: str = "word_level"          # word_level | character_level
-    STABILIZER_FREEZE_THRESHOLD: int = 3         # frozen_prefix, hard_then_frozen: agreements before freezing
-    STABILIZER_MAX_EDIT_DISTANCE: int = 2        # edit_distance: max word edits allowed vs last output
-    STABILIZER_N_CONSECUTIVE: int = 3            # n_consecutive: frames required to confirm a rollback
+    STABILIZER_FREEZE_THRESHOLD: int = 3         # consecutive agreements before freezing a prefix
+    STABILIZER_MAX_EDIT_DISTANCE: int = 2        # max word edits allowed vs last output
+    STABILIZER_N_CONSECUTIVE: int = 3            # repetitions required to confirm a rollback
 
-    # WebSocket settings
-    WS_MAX_CONNECTIONS: int = 200   # hard cap on concurrent WebSocket sessions
-    WS_MAX_QUEUE_SIZE: int = 100
-    WS_PING_INTERVAL: int = 20
-    WS_PING_TIMEOUT: int = 20
-    
-    # Server settings
-    HOST: str = "0.0.0.0"
-    PORT: int = 8000
-    WORKERS: int = 1
-    
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    # ── WebSocket ─────────────────────────────────────────────────────────────
+    WS_MAX_CONNECTIONS: int = 200   # max concurrent sessions
+    WS_MAX_QUEUE_SIZE: int = 100    # outbound message queue depth
+    WS_PING_INTERVAL: int = 20      # seconds between ping frames
+    WS_PING_TIMEOUT: int = 20       # seconds to wait for pong
+
+    # ── Server ────────────────────────────────────────────────────────────────
+    HOST: str = "0.0.0.0"   # set in .env
+    PORT: int = 8000         # set in .env
+    WORKERS: int = 1         # >1 requires shared session state (not supported)
+
+    model_config = {
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "case_sensitive": True,
+    }
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: Type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> Tuple[PydanticBaseSettingsSource, ...]:
+        yaml_path = Path(os.environ.get("SETTINGS_YAML", str(_DEFAULT_YAML)))
+        return (
+            init_settings,                                  # highest — programmatic overrides
+            env_settings,                                   # env vars (Docker, CI)
+            dotenv_settings,                                # .env file
+            YamlSettingsSource(settings_cls, yaml_path),   # settings.yaml
+            # field defaults are the implicit lowest priority
+        )
 
 
 settings = Settings()
