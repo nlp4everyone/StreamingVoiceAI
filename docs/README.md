@@ -33,7 +33,7 @@ Runs via **ONNX runtime** for faster load time and lower CPU overhead. The model
 Advanced pipeline architecture that chains VAD and ASR for optimal performance:
 
 - **Ring buffer**: 12-second rolling ring buffer per session — pre-allocated numpy int16 array (~384 KB/session, 14× less memory than a deque)
-- **Sliding inference window**: 6-second window re-evaluated every 400ms for overlapping context
+- **Sliding inference window**: 6-second window re-evaluated every 600ms for overlapping context
 - **Speech trimming**: VAD crops the inference window to detected speech + padding before ASR; frame probabilities from VAD are reused for trimming to avoid a second ONNX pass
 - **Non-blocking ASR**: audio windows are snapshot-enqueued into a per-session `asyncio.Queue`; a background worker drains the queue under a global semaphore (`ASR_SEMAPHORE_LIMIT`) so the WebSocket receive loop never blocks on ASR latency
 - **Backpressure**: server sends a `backpressure` message to the client when the VAD pool or inference queue is saturated, rate-limited to once per second per session
@@ -55,9 +55,12 @@ Bundled browser UI served at `/` — one-click microphone recording, live transc
 
 ### 🔧 Configuration Management
 
-Pydantic-settings–based configuration for all audio, VAD, ASR, WebSocket, and server parameters.
+Pydantic-settings–based configuration with a four-level priority chain (highest → lowest):
 
-All values are overridable via environment variables or a `.env` file.
+1. Environment variables (Docker `-e` flags, CI)
+2. `.env` file (local dev, not version-controlled) — environment-specific values: URLs, paths, ports, concurrency limits
+3. `config/settings.yaml` — stable algorithm parameters: inference intervals, VAD thresholds, stabilizer settings (version-controlled)
+4. Field defaults in `app/core/config.py`
 
 <br />
 
@@ -74,7 +77,7 @@ cd StreamingVoiceAI/
 
 Create .env file from sample:
 ```
-cp .env.sample .env
+cp .env.example .env
 ```
 
 Configure the NeMo ASR server URL and model in `.env` (or leave defaults):
@@ -83,6 +86,8 @@ NEMO_API_URL=http://localhost:8005/v1/audio/transcriptions
 NEMO_MODEL=nvidia/parakeet-ctc-0.6b-vi
 PORT=8000
 ```
+
+Stable algorithm parameters (inference intervals, VAD thresholds, stabilizer settings) live in `config/settings.yaml` and are version-controlled. Environment-specific values (URLs, paths, ports, concurrency limits) go in `.env`.
 
 Run service with Docker Compose:
 ```
@@ -156,7 +161,7 @@ Navigate to `http://localhost:8000` and click the microphone button (or press `S
 | `GET` | `/` | Serve built-in web client |
 | `GET` | `/static/*` | Static assets (CSS, JS) |
 | `WS` | `/ws/stream` | Streaming audio endpoint |
-| `GET` | `/api/health` | Health check (active sessions + connections) |
+| `GET` | `/health` | Health check (active sessions + connections) |
 
 ### 🔹 WebSocket Protocol
 
@@ -192,7 +197,8 @@ Key configuration parameters in `app/core/config.py` (all overridable via `.env`
 | `SAMPLE_RATE` | 16000 | Audio sample rate (Hz) |
 | `AUDIO_PACKET_MS` | 20 | Expected client packet size |
 | `RING_BUFFER_SECONDS` | 12 | Max audio retained per session |
-| `INFERENCE_INTERVAL_MS` | 400 | How often VAD+STT runs |
+| `INFERENCE_INTERVAL_MS` | 600 | Minimum gap between inference enqueues (ms) |
+| `RMS_SILENCE_THRESHOLD` | 300 | int16 RMS energy gate — skips VAD+ASR on silent windows when not already speaking, freeing VAD pool for active sessions |
 | `INFERENCE_WINDOW_SECONDS` | 6 | Audio window fed to STT |
 | `SILENCE_THRESHOLD_MS` | 700 | Silence duration before finalize |
 | `SPEECH_PADDING_MS` | 200 | Context padding around speech region before ASR |

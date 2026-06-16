@@ -47,13 +47,16 @@ FastAPI WebSocket Gateway  (/ws/stream)
                 ├── TranscriptState  (partial / final transcript + per-session stabilizer)
                 └── inference_queue  (asyncio.Queue, maxsize=INFERENCE_QUEUE_MAXSIZE)
                 │
-                │  handle_audio_packet() enqueues audio_snapshot every 400 ms
+                │  handle_audio_packet() enqueues audio_snapshot every INFERENCE_INTERVAL_MS (600 ms)
                 │  _inference_worker() drains queue per session
                 ▼
         StreamingHandler._inference_worker()  [background asyncio.Task per session]
                 │  async with inference_semaphore  (ASR_SEMAPHORE_LIMIT global cap)
                 ▼
         StreamingHandler._run_inference()
+                │
+                ├──▶ RMS energy gate  [if NOT is_speaking]
+                │       rms < RMS_SILENCE_THRESHOLD (300)?  → skip entirely (frees VAD pool)
                 │
                 ├──▶ VAD pool (asyncio.Queue of VAD_POOL_SIZE SileroVAD instances)
                 │       asyncio.wait_for(pool.get(), timeout=5.0)
@@ -69,14 +72,15 @@ FastAPI WebSocket Gateway  (/ws/stream)
                 │       silence_duration >= INTRA_SILENCE_MS AND not intra_committed
                 │       → TranscriptState.finalize() + send_transcript(is_final=True)
                 │
-                │  if speech detected (decision OR vad_state.is_speaking)
+                │  if speech detected (decision OR vad_state.is_speaking):
+                │    └──▶ Delta gate: last_speech_time unchanged since last ASR?  → skip ASR
                 ▼
         StreamingHandler._trim_to_speech(audio_window, probs)
                 │  SileroVAD.segments_from_probs(probs)   ← reuses VAD probs, no 2nd ONNX pass
                 │  crop to [first_start − padding, last_end + padding]
                 │  falls back to full window if no segments found
                 ▼
-        TranscriptionService.atranscribe(trimmed_audio)  [async]
+        TranscriptionService.atranscribe(trimmed_audio)  [async, asr_call_count++]
           └── NvidiaNemoASREngine.atranscribe(audio)
                     │  encode as in-memory WAV (soundfile, PCM 16-bit)
                     │  shared aiohttp.ClientSession POST multipart/form-data
@@ -157,7 +161,7 @@ App Shutdown  (SIGTERM / lifespan exit)
     │       RingAudioBuffer.append(packet)   ← np.int16 ring buffer, auto-evict oldest
     │
     └─ StreamingService.should_run_inference()
-            elapsed >= INFERENCE_INTERVAL_MS (400 ms) since last snapshot?
+            elapsed >= INFERENCE_INTERVAL_MS (600 ms) since last snapshot?
                 NO  → return  (wait for next packet)
                YES  → get_inference_window()  → last INFERENCE_WINDOW_SECONDS (6 s) of audio
                         session.audio_queue.put_nowait(window)
@@ -169,6 +173,11 @@ App Shutdown  (SIGTERM / lifespan exit)
     │  async with inference_semaphore  ← global cap (ASR_SEMAPHORE_LIMIT=8)
     ▼
     StreamingHandler._run_inference(audio_window)
+    │
+    ├─ RMS energy gate  [if NOT vad_state.is_speaking]
+    │       rms = sqrt(mean(audio_window² ))
+    │       rms < RMS_SILENCE_THRESHOLD (300)?  → skip VAD+ASR entirely — return
+    │           ← frees the VAD pool for sessions that are actively speaking
     │
     ├─ _run_vad(session, audio_window)
     │       asyncio.wait_for(vad_pool.get(), timeout=5.0)
@@ -197,6 +206,12 @@ App Shutdown  (SIGTERM / lifespan exit)
     │   if NOT (decision OR vad_state.is_speaking):
     │       skip STT  ──────────────────────────────────────────────────────┐
     │                                                                        │
+    ├─ Delta gate  [if is_speech OR is_speaking]                             │
+    │       current_speech_ts = vad_state.last_speech_time                  │
+    │       current_speech_ts == session.last_asr_speech_time?               │
+    │           YES → no new speech frames; skip ASR, fall through to ⑧    │
+    │           NO  → update last_asr_speech_time; proceed                  │
+    │                                                                        │
     ├─ _trim_to_speech(audio_window, probs)                                  │
     │       self._vad_ref.segments_from_probs(probs)                         │
     │           ← pure Python; reuses existing probs — no 2nd ONNX pass     │
@@ -205,7 +220,7 @@ App Shutdown  (SIGTERM / lifespan exit)
     │       padding = SPEECH_PADDING_MS (200 ms) = 3200 samples @ 16 kHz   │
     │       no segments found?  → use full audio_window as fallback          │
     │                                                                        │
-    ├─ TranscriptionService.atranscribe(trimmed_audio)                       │
+    ├─ TranscriptionService.atranscribe(trimmed_audio)  [asr_call_count++]  │
     │       NvidiaNemoASREngine.atranscribe()                                │
     │           soundfile → in-memory BytesIO WAV (PCM 16-bit, mono)        │
     │           shared aiohttp.ClientSession POST multipart/form-data        │
@@ -223,8 +238,9 @@ App Shutdown  (SIGTERM / lifespan exit)
     │       TranscriptState.update_partial(stabilized)                      │
     │       ConnectionManager.send_transcript(is_final=False)                │
     │                                               ◄────────────────────────┘
-    └─ if NOT vad_state.is_speaking AND partial_transcript exists:
+⑧  └─ if NOT vad_state.is_speaking AND partial_transcript exists:
             _finalize_transcript()
+                log asr_call_count for this turn; reset counter
                 if FINALIZE_RIGHT_PADDING_ENABLED=True:
                     _extract_final_window()
                         end_ago   = now − last_speech_time − FINALIZE_RIGHT_PADDING_MS
@@ -300,7 +316,7 @@ t=0.8s  [0.8s → 6.8s]
 | `GET` | `/` | Serve static web client (`static/index.html`) |
 | `GET` | `/static/*` | Static assets (CSS, JS) |
 | `WS` | `/ws/stream` | Streaming audio endpoint |
-| `GET` | `/health` | Health check (active sessions + connections) |
+| `GET` | `/health` | Health check — returns active session count and open WebSocket connection count |
 
 ---
 
@@ -318,13 +334,17 @@ Entry point for all WebSocket connections. Responsibilities:
 ## StreamingHandler (`app/websocket/handlers.py`)
 
 Per-packet orchestration — the main processing pipeline:
-- `handle_audio_packet()` — appends to buffer, snapshots audio window every 400ms and enqueues to the session's `inference_queue`; sends `backpressure` if queue is full
+- `handle_audio_packet()` — appends to buffer, snapshots audio window every `INFERENCE_INTERVAL_MS` (600ms) and enqueues to the session's `inference_queue`; sends `backpressure` if queue is full
 - `start_inference_worker()` — spawns a background `asyncio.Task` per session that drains `inference_queue` under the global `inference_semaphore`
-- `_run_inference()` — acquires VAD → intra-commit check → trim → STT → stabilize → send; sends `backpressure` if VAD pool is exhausted
+- `_run_inference()` — three-layer gate before ASR:
+  1. **RMS energy gate** — skips VAD+ASR entirely when the window RMS is below `RMS_SILENCE_THRESHOLD` and the session is not mid-utterance; frees the shared VAD pool for active sessions
+  2. **VAD gate** — runs Silero VAD to get speech decision and per-frame probabilities
+  3. **Delta gate** — skips ASR when `vad_state.last_speech_time` hasn't advanced since the previous call (window is pure silence, no new speech frames)
+  Then: trim → STT → stabilize → send; sends `backpressure` if VAD pool is exhausted
 - `_handle_intra_commit()` — commits the current partial as final on mid-utterance pauses (`INTRA_SILENCE_MS`); fires once per pause (guarded by `vad_state.intra_committed`)
 - `_trim_to_speech(audio_window, probs)` — crops the 6s inference window to the detected speech region + padding using frame probs already computed by `is_speech()`, avoiding a second ONNX pass
 - `_extract_final_window()` — extracts a precisely-bounded audio slice `[speech_start − SPEECH_PADDING_MS, last_speech_time + FINALIZE_RIGHT_PADDING_MS]` from the ring buffer for the final ASR pass
-- `_finalize_transcript()` — optionally runs a dedicated final ASR pass over the precise speech window, then promotes the partial to final and sends `is_final=True`
+- `_finalize_transcript()` — logs ASR call count for the turn, optionally runs a dedicated final ASR pass over the precise speech window, then promotes the partial to final and sends `is_final=True`
 - `handle_control_message()` — `start` resets state; `stop` flushes pending partial as final
 - `cleanup_session()` — stops inference worker, flushes pending partial, removes session
 
@@ -350,6 +370,10 @@ Pydantic models for all message types:
 `VADState` tracks `is_speaking`, `speech_start_time`, `last_speech_time`, `silence_duration_ms`, and `intra_committed` (prevents duplicate intra-utterance commits per pause).
 
 `TranscriptState` owns a **per-session `BaseStabilizer`** instance (created by `create_stabilizer()` at session construction). Calling `finalize()` promotes `partial_transcript` to `final_transcript` and calls `stabilizer.reset()` so frozen state from this utterance does not bleed into the next.
+
+`StreamingSession` additionally tracks:
+- `asr_call_count` — ASR requests made during the current speech turn; logged on finalize and reset each turn
+- `last_asr_speech_time` — `vad_state.last_speech_time` snapshot at the last ASR call; used by the delta gate to skip calls where no new speech frames arrived
 
 ## Ring Buffer (`app/audio/buffer.py`)
 
@@ -456,12 +480,21 @@ previous partial — suppressing no-op updates.
 
 # Configuration (`app/core/config.py`)
 
+Config is loaded in priority order (highest → lowest):
+1. Environment variables (Docker `-e` flags, CI)
+2. `.env` file (local dev, not version-controlled) — environment-specific: URLs, paths, ports, concurrency limits
+3. `config/settings.yaml` — stable algorithm params: inference intervals, VAD thresholds, stabilizer settings (version-controlled)
+4. Field defaults in `app/core/config.py`
+
+Override `SETTINGS_YAML` env var to point to a different YAML file.
+
 | Parameter | Default | Description |
 |---|---|---|
 | `SAMPLE_RATE` | 16000 | Audio sample rate (Hz) |
 | `AUDIO_PACKET_MS` | 20 | Expected client packet size |
 | `RING_BUFFER_SECONDS` | 12 | Max audio retained per session (pre-allocated np.int16 ring buffer) |
-| `INFERENCE_INTERVAL_MS` | 400 | How often VAD+STT runs |
+| `INFERENCE_INTERVAL_MS` | 600 | Minimum gap between inference enqueues (ms) |
+| `RMS_SILENCE_THRESHOLD` | 300 | int16 RMS energy gate — skips VAD+ASR on silent windows when session is not mid-utterance; frees VAD pool for active sessions |
 | `INFERENCE_WINDOW_SECONDS` | 6 | Audio window fed to STT |
 | `SILENCE_THRESHOLD_MS` | 700 | Silence before utterance finalize |
 | `SPEECH_PADDING_MS` | 200 | Context padding around speech region before ASR |
@@ -483,9 +516,11 @@ previous partial — suppressing no-op updates.
 | `STABILIZER_FREEZE_THRESHOLD` | 3 | Consecutive agreements before freezing a prefix (`frozen_prefix`, `hard_then_frozen`) |
 | `STABILIZER_MAX_EDIT_DISTANCE` | 2 | Max word edits allowed vs last output (`edit_distance`) |
 | `STABILIZER_N_CONSECUTIVE` | 3 | Frames required to confirm a rollback (`n_consecutive`) |
-| `NEMO_API_URL` | `http://172.17.0.1:8005/v1/audio/transcriptions` | NeMo server endpoint |
+| `STT_DEVICE` | `cuda` | Inference device — `cuda` \| `cpu` (set in `.env`) |
+| `STT_BATCH_SIZE` | 1 | Batch size reserved for future local model use |
+| `NEMO_API_URL` | `http://localhost:8005/v1/audio/transcriptions` | NeMo server endpoint (set in `.env`) |
 | `NEMO_MODEL` | `nvidia/parakeet-ctc-0.6b-vi` | Model identifier |
-| `ASR_SEMAPHORE_LIMIT` | 8 | Max concurrent NeMo HTTP requests across all sessions |
+| `ASR_SEMAPHORE_LIMIT` | 8 | Max concurrent NeMo HTTP requests across all sessions (set in `.env`) |
 | `INFERENCE_QUEUE_MAXSIZE` | 3 | Per-session queue depth; excess windows are dropped |
 | `ASR_CONNECT_TIMEOUT` | 2.0 | Seconds to establish TCP connection to NeMo |
 | `ASR_REQUEST_TIMEOUT` | 10.0 | Seconds for full NeMo request (connect + transfer + response) |
