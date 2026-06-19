@@ -388,6 +388,22 @@ class StreamingHandler:
         current_time = datetime.now()
         was_speaking = session.vad_state.is_speaking
 
+        # Trailing-window correction: the inference window may still contain old
+        # speech after the user stopped talking, causing VAD to return is_speech=True
+        # even during silence. Override when the last speech segment in the window
+        # ended >= SILENCE_THRESHOLD_MS ago.
+        if is_speech and probs:
+            window_ms = len(audio_window) / settings.SAMPLE_RATE * 1000
+            segments = self._vad_ref.segments_from_probs(probs)
+            if segments and (window_ms - segments[-1][1]) >= settings.TRAILING_SILENCE_MS:
+                logger.debug(
+                    "[%s] Trailing-window correction: last speech ended %.0f ms ago (>= %d ms) — overriding is_speech=False",
+                    session.session_id,
+                    window_ms - segments[-1][1],
+                    settings.TRAILING_SILENCE_MS,
+                )
+                is_speech = False
+
         # Step 4: Update VAD state machine (silence gate applies SILENCE_THRESHOLD_MS grace)
         session.vad_state.update(is_speech, current_time)
 
