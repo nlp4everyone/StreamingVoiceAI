@@ -226,7 +226,13 @@ class StreamingHandler:
                         "[%s] Right-finalize ASR result: '%s'",
                         session.session_id, transcript,
                     )
-                    session.transcript_state.update_partial(transcript)
+                    # Run through stabilizer to apply frozen prefix — prevents raw ASR
+                    # from overwriting already-committed text with "Unk" or regressions.
+                    stabilized = self.stabilization_service.stabilize(
+                        session.transcript_state.stabilizer,
+                        transcript,
+                    )
+                    session.transcript_state.update_partial(stabilized)
 
         # Step 3: Promote partial to final and send the committed text to the client
         session.transcript_state.finalize()
@@ -433,6 +439,8 @@ class StreamingHandler:
                 # Skip ASR but fall through to Step 8 so silence detection still finalizes.
             else:
                 session.last_asr_speech_time = current_speech_ts
+                # Adaptive interval step 1: new speech → reset to onset interval.
+                session.current_interval_ms = settings.ONSET_INTERVAL_MS
                 audio_to_transcribe = self._trim_to_speech(audio_window, probs)
 
                 # Minimum trimmed audio gate: skip ASR when the post-trim window is too
@@ -468,6 +476,17 @@ class StreamingHandler:
                             await self.connection_manager.send_transcript(
                                 session.session_id, stabilized, is_final=False
                             )
+
+                        # Adaptive interval step 2: back off when transcript unchanged, reset on change.
+                        if stabilized == session.last_partial_for_stability:
+                            session.current_interval_ms = settings.STABLE_INTERVAL_MS
+                            logger.debug(
+                                "[%s] Adaptive interval: transcript stable — backed off to %dms",
+                                session.session_id, settings.STABLE_INTERVAL_MS,
+                            )
+                        else:
+                            session.current_interval_ms = settings.ONSET_INTERVAL_MS
+                            session.last_partial_for_stability = stabilized
                     else:
                         logger.debug(f"[{session.session_id}] ASR returned empty transcript")
 

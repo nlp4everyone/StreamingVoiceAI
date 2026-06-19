@@ -48,7 +48,10 @@ class Settings(BaseSettings):
     SAMPLE_RATE: int = 16000             # Hz
     AUDIO_PACKET_MS: int = 20            # incoming WebSocket chunk size
     RING_BUFFER_SECONDS: int = 12        # rolling audio buffer length
-    INFERENCE_INTERVAL_MS: int = 600     # min gap between ASR calls
+    INFERENCE_INTERVAL_MS: int = 600     # min gap between ASR calls (used by chunker; runtime uses ONSET/STABLE below)
+    ADAPTIVE_INTERVAL_ENABLED: bool = True  # adaptive interval: dynamically switch between ONSET/STABLE intervals
+    ONSET_INTERVAL_MS: int = 400         # adaptive interval (onset): pacing right after speech begins — favors fast partials
+    STABLE_INTERVAL_MS: int = 1200       # adaptive interval (stable): pacing when transcript stops changing — reduces redundant ASR calls
     RMS_SILENCE_THRESHOLD: int = 300     # int16 RMS below this skips VAD+ASR when not already speaking; frees VAD pool for active sessions
     INFERENCE_WINDOW_SECONDS: int = 6    # audio window sent to ASR
     SILENCE_THRESHOLD_MS: int = 700      # silence duration that ends an utterance

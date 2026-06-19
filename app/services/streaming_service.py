@@ -78,9 +78,11 @@ class StreamingService:
             return True
 
         elapsed_ms = (datetime.now() - session.last_inference_time).total_seconds() * 1000
-        ready = elapsed_ms >= settings.INFERENCE_INTERVAL_MS
+        # Adaptive interval: use per-session dynamic threshold; fallback to fixed INFERENCE_INTERVAL_MS.
+        threshold_ms = session.current_interval_ms if settings.ADAPTIVE_INTERVAL_ENABLED else settings.INFERENCE_INTERVAL_MS
+        ready = elapsed_ms >= threshold_ms
         logger.debug(
-            "[%s] Inference interval check — elapsed=%.0fms threshold=%sms ready=%s",
-            session.session_id, elapsed_ms, settings.INFERENCE_INTERVAL_MS, ready,
+            "[%s] Inference interval check — elapsed=%.0fms threshold=%dms ready=%s",
+            session.session_id, elapsed_ms, threshold_ms, ready,
         )
         return ready

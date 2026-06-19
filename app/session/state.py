@@ -120,6 +120,11 @@ class StreamingSession:
         # If VAD's last_speech_time hasn't advanced since then, no new speech
         # frames arrived and the enqueue is skipped.
         self.last_asr_speech_time: Optional[datetime] = None
+
+        # Adaptive pacing: starts at onset interval, backs off to stable interval
+        # when the partial transcript stops changing between consecutive ASR calls.
+        self.current_interval_ms: int = settings.ONSET_INTERVAL_MS
+        self.last_partial_for_stability: str = ""
     
     def should_signal_backpressure(self, now: datetime, min_interval_s: float = 1.0) -> bool:
         """True if enough time has passed since the last backpressure signal to the client."""
@@ -148,6 +153,8 @@ class StreamingSession:
         self.last_backpressure_signal = None
         self.asr_call_count = 0
         self.last_asr_speech_time = None
+        self.current_interval_ms = settings.ONSET_INTERVAL_MS
+        self.last_partial_for_stability = ""
         # Drain the queue so the worker doesn't process stale windows after reset.
         while not self.audio_queue.empty():
             self.audio_queue.get_nowait()
