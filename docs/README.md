@@ -33,11 +33,13 @@ Runs via **ONNX runtime** for faster load time and lower CPU overhead. The model
 Advanced pipeline architecture that chains VAD and ASR for optimal performance:
 
 - **Ring buffer**: 12-second rolling ring buffer per session — pre-allocated numpy int16 array (~384 KB/session, 14× less memory than a deque)
-- **Sliding inference window**: 6-second window re-evaluated every 600ms for overlapping context
+- **Adaptive inference interval**: pacing dynamically switches between `ONSET_INTERVAL_MS` (400ms, fast partials) on new speech and `STABLE_INTERVAL_MS` (1200ms, reduced load) when the transcript stops changing; falls back to fixed `INFERENCE_INTERVAL_MS` when disabled
+- **Sliding inference window**: 6-second window re-evaluated at the current adaptive interval for overlapping context
 - **Speech trimming**: VAD crops the inference window to detected speech + padding before ASR; frame probabilities from VAD are reused for trimming to avoid a second ONNX pass
 - **Non-blocking ASR**: audio windows are snapshot-enqueued into a per-session `asyncio.Queue`; a background worker drains the queue under a global semaphore (`ASR_SEMAPHORE_LIMIT`) so the WebSocket receive loop never blocks on ASR latency
 - **Backpressure**: server sends a `backpressure` message to the client when the VAD pool or inference queue is saturated, rate-limited to once per second per session
-- **Silence finalization**: 700ms of silence triggers a final transcript flush
+- **Trailing-silence window correction**: overrides `is_speech=True` when the last speech segment in the inference window ended ≥ `TRAILING_SILENCE_MS` ago — prevents stale VAD decisions from triggering unnecessary ASR calls at end of utterance, reducing ASR calls by ~50%
+- **Silence finalization**: 800ms of silence triggers a final transcript flush; the dedicated final ASR pass is run through the stabilizer to prevent raw ASR regressions overwriting committed text
 - **Multi-user**: concurrent sessions are fully isolated with independent buffers and state
 
 ### 🧩 Transcript Stabilization (LCP)
@@ -197,15 +199,19 @@ Key configuration parameters in `app/core/config.py` (all overridable via `.env`
 | `SAMPLE_RATE` | 16000 | Audio sample rate (Hz) |
 | `AUDIO_PACKET_MS` | 20 | Expected client packet size |
 | `RING_BUFFER_SECONDS` | 12 | Max audio retained per session |
-| `INFERENCE_INTERVAL_MS` | 600 | Minimum gap between inference enqueues (ms) |
+| `INFERENCE_INTERVAL_MS` | 600 | Fixed inference interval (ms) — used by chunker and as fallback when `ADAPTIVE_INTERVAL_ENABLED=false` |
+| `ADAPTIVE_INTERVAL_ENABLED` | `true` | Dynamically switch pacing between `ONSET_INTERVAL_MS` and `STABLE_INTERVAL_MS` |
+| `ONSET_INTERVAL_MS` | 400 | Adaptive interval (onset): pacing right after speech begins — favors fast partials |
+| `STABLE_INTERVAL_MS` | 1200 | Adaptive interval (stable): pacing when transcript stops changing — reduces redundant ASR calls |
 | `RMS_SILENCE_THRESHOLD` | 300 | int16 RMS energy gate — skips VAD+ASR on silent windows when not already speaking, freeing VAD pool for active sessions |
 | `INFERENCE_WINDOW_SECONDS` | 6 | Audio window fed to STT |
-| `SILENCE_THRESHOLD_MS` | 700 | Silence duration before finalize |
+| `SILENCE_THRESHOLD_MS` | 800 | Silence duration before finalize |
+| `TRAILING_SILENCE_MS` | 1000 | Trailing silence in the inference window that overrides `is_speech=True` — prevents stale VAD detections; reduces ASR calls by ~50% at utterance end |
 | `SPEECH_PADDING_MS` | 200 | Context padding around speech region before ASR |
 | `VAD_THRESHOLD` | 0.6 | Silero speech probability cutoff (`ema_smoothed` / `consecutive_frames`) |
 | `VAD_ONSET_THRESHOLD` | 0.65 | Prob to **enter** speaking state (`state_machine` strategy) |
 | `VAD_OFFSET_THRESHOLD` | 0.40 | Prob to **exit** speaking state — hysteresis band prevents chattering |
-| `VAD_TRIGGER_STRATEGY` | `ema_smoothed` | Active VAD strategy (`consecutive_frames` \| `ema_smoothed` \| `state_machine`) |
+| `VAD_TRIGGER_STRATEGY` | `state_machine` | Active VAD strategy (`consecutive_frames` \| `ema_smoothed` \| `state_machine`) |
 | `VAD_POOL_SIZE` | 8 | Number of parallel VAD instances in the async pool |
 | `VAD_MODEL_PATH` | `/app/models/silero_vad.onnx` | Path to the Silero VAD ONNX model file |
 | `VAD_USE_INT8` | `false` | Quantize FP32 model to INT8 on first startup (`_int8.onnx` cached on disk) |
@@ -228,6 +234,7 @@ Key configuration parameters in `app/core/config.py` (all overridable via `.env`
 ### 🎯 Voice Activity Detection (VAD)
 - [x] Implement Silero VAD with pluggable trigger strategies
 - [x] Speech trimming to crop inference window before ASR
+- [x] Trailing-silence window correction — overrides stale `is_speech=True`; ~50% fewer ASR calls at utterance end
 
 ### 🤖 ASR Integration
 - [x] Async HTTP client for NVIDIA NeMo ASR inference server
@@ -237,6 +244,7 @@ Key configuration parameters in `app/core/config.py` (all overridable via `.env`
 - [x] LCP stabilizer — word-level (Vietnamese) and character-level modes
 - [x] Pluggable rollback suppression strategies (`frozen_prefix`, `hard_length`, `edit_distance`, `n_consecutive`, `hard_then_frozen`) with per-session state isolation
 - [x] Intra-utterance silence commit and right-finalize padding for accurate segment boundaries
+- [x] Stabilizer applied to final ASR pass — prevents raw ASR regressions overwriting committed text
 
 ### 🖥️ Web Client
 - [x] Built-in browser UI with microphone recording and live transcripts
@@ -245,6 +253,7 @@ Key configuration parameters in `app/core/config.py` (all overridable via `.env`
 - [x] Pure ONNX runtime for SileroVAD — no PyTorch (↓ 91% disk / ↓ 76% RAM); model baked into Docker image layer
 - [x] Pre-allocated np.int16 ring buffer (↓ 14× memory); VAD async pool + per-session inference queue (non-blocking receive loop)
 - [x] Backpressure signaling, shared aiohttp ClientSession, structured logging
+- [x] Adaptive inference interval — fast partials at onset (400ms), back off when stable (1200ms)
 - [ ] Split configuration file
 
 ### 🛡️ Fault Tolerance

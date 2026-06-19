@@ -47,7 +47,8 @@ FastAPI WebSocket Gateway  (/ws/stream)
                 ├── TranscriptState  (partial / final transcript + per-session stabilizer)
                 └── inference_queue  (asyncio.Queue, maxsize=INFERENCE_QUEUE_MAXSIZE)
                 │
-                │  handle_audio_packet() enqueues audio_snapshot every INFERENCE_INTERVAL_MS (600 ms)
+                │  handle_audio_packet() enqueues audio_snapshot at adaptive interval
+                │    (ONSET_INTERVAL_MS=400ms on new speech; STABLE_INTERVAL_MS=1200ms when transcript stable)
                 │  _inference_worker() drains queue per session
                 ▼
         StreamingHandler._inference_worker()  [background asyncio.Task per session]
@@ -161,8 +162,8 @@ App Shutdown  (SIGTERM / lifespan exit)
     │       RingAudioBuffer.append(packet)   ← np.int16 ring buffer, auto-evict oldest
     │
     └─ StreamingService.should_run_inference()
-            elapsed >= INFERENCE_INTERVAL_MS (600 ms) since last snapshot?
-                NO  → return  (wait for next packet)
+            elapsed >= session.current_interval_ms?   ← adaptive: 400ms (onset) or 1200ms (stable)
+                NO  → return  (wait for next packet)   ← falls back to INFERENCE_INTERVAL_MS (600ms) if ADAPTIVE_INTERVAL_ENABLED=false
                YES  → get_inference_window()  → last INFERENCE_WINDOW_SECONDS (6 s) of audio
                         session.audio_queue.put_nowait(window)
                           QueueFull?  → dropped_windows++
@@ -190,8 +191,12 @@ App Shutdown  (SIGTERM / lifespan exit)
     │       vad_pool.put_nowait(vad)   ← release immediately after inference
     │       returns (decision: bool, probs: list[float])
     │
+    │   Trailing-silence window correction  [before VADState.update]
+    │       is_speech=True AND last speech segment ended >= TRAILING_SILENCE_MS (1000ms) ago?
+    │           YES → override is_speech=False  ← prevents stale VAD; ~50% fewer ASR calls at utterance end
+    │
     │   VADState.update(decision, now)
-    │       silence_duration >= SILENCE_THRESHOLD_MS (700 ms)  →  is_speaking = False
+    │       silence_duration >= SILENCE_THRESHOLD_MS (800 ms)  →  is_speaking = False
     │
     ├─ _handle_intra_commit()   [if INTRA_SILENCE_COMMIT_ENABLED=True]
     │       fires when: is_speaking=True
@@ -210,7 +215,8 @@ App Shutdown  (SIGTERM / lifespan exit)
     │       current_speech_ts = vad_state.last_speech_time                  │
     │       current_speech_ts == session.last_asr_speech_time?               │
     │           YES → no new speech frames; skip ASR, fall through to ⑧    │
-    │           NO  → update last_asr_speech_time; proceed                  │
+    │           NO  → update last_asr_speech_time                           │
+    │                 adaptive interval step 1: reset to ONSET_INTERVAL_MS  │
     │                                                                        │
     ├─ _trim_to_speech(audio_window, probs)                                  │
     │       self._vad_ref.segments_from_probs(probs)                         │
@@ -237,6 +243,9 @@ App Shutdown  (SIGTERM / lifespan exit)
     ├─ if stabilized != previous_partial:                                    │
     │       TranscriptState.update_partial(stabilized)                      │
     │       ConnectionManager.send_transcript(is_final=False)                │
+    │                                                                        │
+    │   adaptive interval step 2: transcript unchanged → STABLE_INTERVAL_MS │
+    │                             transcript changed   → ONSET_INTERVAL_MS  │
     │                                               ◄────────────────────────┘
 ⑧  └─ if NOT vad_state.is_speaking AND partial_transcript exists:
             _finalize_transcript()
@@ -247,6 +256,7 @@ App Shutdown  (SIGTERM / lifespan exit)
                         start_ago = now − speech_start_time + SPEECH_PADDING_MS
                         RingAudioBuffer.get_range(start_ago, end_ago)
                     atranscribe(final_window)   ← dedicated ASR pass, precise boundaries
+                    stabilize(final_window)     ← frozen prefix applied; prevents "Unk" regressions
                     overrides partial if result non-empty
                 TranscriptState.finalize()       ← partial → final; stabilizer.reset()
                 send_transcript(is_final=True)
@@ -334,7 +344,7 @@ Entry point for all WebSocket connections. Responsibilities:
 ## StreamingHandler (`app/websocket/handlers.py`)
 
 Per-packet orchestration — the main processing pipeline:
-- `handle_audio_packet()` — appends to buffer, snapshots audio window every `INFERENCE_INTERVAL_MS` (600ms) and enqueues to the session's `inference_queue`; sends `backpressure` if queue is full
+- `handle_audio_packet()` — appends to buffer, snapshots audio window at the current adaptive interval (`ONSET_INTERVAL_MS`=400ms or `STABLE_INTERVAL_MS`=1200ms) and enqueues to the session's `inference_queue`; sends `backpressure` if queue is full
 - `start_inference_worker()` — spawns a background `asyncio.Task` per session that drains `inference_queue` under the global `inference_semaphore`
 - `_run_inference()` — three-layer gate before ASR:
   1. **RMS energy gate** — skips VAD+ASR entirely when the window RMS is below `RMS_SILENCE_THRESHOLD` and the session is not mid-utterance; frees the shared VAD pool for active sessions
@@ -344,7 +354,7 @@ Per-packet orchestration — the main processing pipeline:
 - `_handle_intra_commit()` — commits the current partial as final on mid-utterance pauses (`INTRA_SILENCE_MS`); fires once per pause (guarded by `vad_state.intra_committed`)
 - `_trim_to_speech(audio_window, probs)` — crops the 6s inference window to the detected speech region + padding using frame probs already computed by `is_speech()`, avoiding a second ONNX pass
 - `_extract_final_window()` — extracts a precisely-bounded audio slice `[speech_start − SPEECH_PADDING_MS, last_speech_time + FINALIZE_RIGHT_PADDING_MS]` from the ring buffer for the final ASR pass
-- `_finalize_transcript()` — logs ASR call count for the turn, optionally runs a dedicated final ASR pass over the precise speech window, then promotes the partial to final and sends `is_final=True`
+- `_finalize_transcript()` — logs ASR call count for the turn, optionally runs a dedicated final ASR pass over the precise speech window (result is passed through the stabilizer to apply the frozen prefix and prevent raw ASR regressions), then promotes the partial to final and sends `is_final=True`
 - `handle_control_message()` — `start` resets state; `stop` flushes pending partial as final
 - `cleanup_session()` — stops inference worker, flushes pending partial, removes session
 
@@ -374,6 +384,8 @@ Pydantic models for all message types:
 `StreamingSession` additionally tracks:
 - `asr_call_count` — ASR requests made during the current speech turn; logged on finalize and reset each turn
 - `last_asr_speech_time` — `vad_state.last_speech_time` snapshot at the last ASR call; used by the delta gate to skip calls where no new speech frames arrived
+- `current_interval_ms` — per-session adaptive pacing threshold; starts at `ONSET_INTERVAL_MS`, backs off to `STABLE_INTERVAL_MS` when transcript is stable, resets on new speech
+- `last_partial_for_stability` — last stabilized transcript used to detect when the hypothesis has stopped changing
 
 ## Ring Buffer (`app/audio/buffer.py`)
 
@@ -493,10 +505,14 @@ Override `SETTINGS_YAML` env var to point to a different YAML file.
 | `SAMPLE_RATE` | 16000 | Audio sample rate (Hz) |
 | `AUDIO_PACKET_MS` | 20 | Expected client packet size |
 | `RING_BUFFER_SECONDS` | 12 | Max audio retained per session (pre-allocated np.int16 ring buffer) |
-| `INFERENCE_INTERVAL_MS` | 600 | Minimum gap between inference enqueues (ms) |
+| `INFERENCE_INTERVAL_MS` | 600 | Fixed inference interval (ms) — chunker and fallback when `ADAPTIVE_INTERVAL_ENABLED=false` |
+| `ADAPTIVE_INTERVAL_ENABLED` | `true` | Dynamically switch pacing between `ONSET_INTERVAL_MS` and `STABLE_INTERVAL_MS` |
+| `ONSET_INTERVAL_MS` | 400 | Adaptive interval (onset): pacing right after speech begins — favors fast partials |
+| `STABLE_INTERVAL_MS` | 1200 | Adaptive interval (stable): pacing when transcript stops changing — reduces redundant ASR calls |
 | `RMS_SILENCE_THRESHOLD` | 300 | int16 RMS energy gate — skips VAD+ASR on silent windows when session is not mid-utterance; frees VAD pool for active sessions |
 | `INFERENCE_WINDOW_SECONDS` | 6 | Audio window fed to STT |
-| `SILENCE_THRESHOLD_MS` | 700 | Silence before utterance finalize |
+| `SILENCE_THRESHOLD_MS` | 800 | Silence before utterance finalize |
+| `TRAILING_SILENCE_MS` | 1000 | Trailing silence in the inference window that overrides `is_speech=True` — prevents stale VAD detections; reduces ASR calls by ~50% at utterance end |
 | `SPEECH_PADDING_MS` | 200 | Context padding around speech region before ASR |
 | `INTRA_SILENCE_COMMIT_ENABLED` | `true` | Commit partial as final on mid-utterance pauses |
 | `INTRA_SILENCE_MS` | 300 | Pause duration to trigger intra-utterance commit; must be < `SILENCE_THRESHOLD_MS` |
@@ -507,7 +523,7 @@ Override `SETTINGS_YAML` env var to point to a different YAML file.
 | `VAD_OFFSET_THRESHOLD` | 0.40 | Prob to **exit** speaking state — hysteresis band = [0.40, 0.65] |
 | `VAD_SAMPLE_RATE` | 16000 | VAD expected sample rate |
 | `VAD_WINDOW_SIZE_SAMPLES` | 512 | Frame size for VAD scoring (32ms at 16kHz) |
-| `VAD_TRIGGER_STRATEGY` | `ema_smoothed` | Active VAD strategy |
+| `VAD_TRIGGER_STRATEGY` | `state_machine` | Active VAD strategy |
 | `VAD_POOL_SIZE` | 8 | Number of parallel VAD instances in the async pool |
 | `VAD_MODEL_PATH` | `/app/models/silero_vad.onnx` | Path to the Silero VAD ONNX model |
 | `VAD_USE_INT8` | `false` | Quantize FP32 → INT8 on first startup (`_int8.onnx` cached on disk) |
