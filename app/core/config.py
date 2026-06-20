@@ -101,7 +101,7 @@ class Settings(BaseSettings):
     # ── Server ────────────────────────────────────────────────────────────────
     HOST: str = "0.0.0.0"   # set in .env
     PORT: int = 8000         # set in .env
-    WORKERS: int = 1         # >1 requires shared session state (not supported)
+    WORKERS: int = 1         # Uvicorn worker count — each WebSocket connection is process-local, no shared state needed
 
     model_config = {
         "env_file": ".env",

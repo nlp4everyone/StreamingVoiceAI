@@ -4,6 +4,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.web
     container_name: streaming_asr_web
+    env_file: ../.env
     ports:
       - "${PORT:-8000}:8000"
     restart: unless-stopped
