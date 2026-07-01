@@ -1,4 +1,4 @@
-# 🎙️ StreamingVoiceAI
+# 🎙️ StreamSpeak
 
 A production-ready multi-user streaming Speech-to-Text framework built with FastAPI and WebSocket for low-latency real-time transcription.
 
@@ -16,11 +16,28 @@ A production-ready multi-user streaming Speech-to-Text framework built with Fast
 
 <br />
 
+## Prerequisite: ASR Backend
+
+StreamSpeak sends audio to an external NeMo ASR server for transcription — it does not run inference itself. Deploy [VoicePlatform](https://github.com/nlp4everyone/VoicePlatform) first:
+
+```bash
+git clone https://github.com/nlp4everyone/VoicePlatform.git
+cd VoicePlatform/
+git fetch && git checkout ray/nvidia_asr
+cp .env.sample .env
+# set HF_TOKEN in .env (required to download the Pyannote VAD model)
+bash run_service.sh
+```
+
+This exposes the OpenAI-compatible ASR API at `http://localhost:8005/v1/audio/transcriptions`, which StreamSpeak's `NEMO_API_URL` points to below.
+
+<br />
+
 ## Installation
 
 ```bash
-git clone https://github.com/nlp4everyone/StreamingVoiceAI.git
-cd StreamingVoiceAI/
+git clone https://github.com/nlp4everyone/StreamSpeak.git
+cd StreamSpeak/
 cp .env.example .env
 ```
 

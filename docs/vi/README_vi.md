@@ -1,4 +1,4 @@
-# 🎙️ StreamingVoiceAI
+# 🎙️ StreamSpeak
 
 Framework nhận dạng giọng nói theo thời gian thực (Speech-to-Text), hỗ trợ nhiều người dùng đồng thời, xây dựng trên FastAPI và WebSocket với độ trễ thấp.
 
@@ -16,11 +16,28 @@ Framework nhận dạng giọng nói theo thời gian thực (Speech-to-Text), h
 
 <br />
 
+## Điều kiện tiên quyết: ASR Backend
+
+StreamSpeak gửi audio tới một NeMo ASR server bên ngoài để nhận dạng — bản thân nó không thực hiện inference. Cần deploy [VoicePlatform](https://github.com/nlp4everyone/VoicePlatform) trước:
+
+```bash
+git clone https://github.com/nlp4everyone/VoicePlatform.git
+cd VoicePlatform/
+git fetch && git checkout ray/nvidia_asr
+cp .env.sample .env
+# thiết lập HF_TOKEN trong .env (cần để tải model Pyannote VAD)
+bash run_service.sh
+```
+
+Lệnh này sẽ mở API ASR tương thích OpenAI tại `http://localhost:8005/v1/audio/transcriptions` — chính là địa chỉ mà `NEMO_API_URL` của StreamSpeak sẽ trỏ tới ở bước dưới đây.
+
+<br />
+
 ## Cài đặt
 
 ```bash
-git clone https://github.com/nlp4everyone/StreamingVoiceAI.git
-cd StreamingVoiceAI/
+git clone https://github.com/nlp4everyone/StreamSpeak.git
+cd StreamSpeak/
 cp .env.example .env
 ```
 
