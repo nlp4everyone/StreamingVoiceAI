@@ -52,7 +52,7 @@ PORT=8000
 
 Chạy bằng Docker Compose:
 ```bash
-bash run_service.sh
+make up
 ```
 
 Mở trình duyệt tại `http://localhost:8000`.

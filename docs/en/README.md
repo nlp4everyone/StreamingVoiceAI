@@ -52,7 +52,7 @@ PORT=8000
 
 Run with Docker Compose:
 ```bash
-bash run_service.sh
+make up
 ```
 
 Open `http://localhost:8000` in your browser.
