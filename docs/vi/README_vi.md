@@ -61,29 +61,19 @@ Mở trình duyệt tại `http://localhost:8000`.
 
 ## Ví dụ nhanh (Python Client)
 
-```python
-import asyncio, base64, json
-import numpy as np
-import websockets
+`scripts/stream_audio.py` gửi một file WAV tới WebSocket endpoint dưới dạng các gói PCM 20ms theo nhịp thời gian thực, và in ra transcript partial/final ngay khi nhận được:
 
-async def stream_audio():
-    uri = "ws://localhost:8000/ws/stream"
-    async with websockets.connect(uri) as ws:
-        info = json.loads(await ws.recv())
-        print("Session:", info["session_id"])
+```bash
+python scripts/stream_audio.py [path/to/audio.wav]
+```
 
-        # Gửi gói PCM int16 20ms tại 16kHz
-        pcm = np.zeros(320, dtype=np.int16)   # thay bằng audio thật từ microphone
-        await ws.send(json.dumps({
-            "type": "audio",
-            "data": base64.b64encode(pcm.tobytes()).decode(),
-            "sample_rate": 16000
-        }))
+Mặc định dùng `resources/sample_vi.wav` nếu không truyền đường dẫn. File audio sẽ được downmix về mono và resample về 16kHz nếu cần. Ví dụ output:
 
-        msg = json.loads(await ws.recv())
-        print(f"[is_final={msg['is_final']}] {msg['text']}")
-
-asyncio.run(stream_audio())
+```
+Session: session_5246de00-aacc-45d1-8b77-be810a5d488e
+[is_final=False] Xin chào các bạn.
+[is_final=False] Xin chào các bạn hôm nay chúng ta.
+[is_final=True] Xin chào các bạn hôm nay chúng ta cùng tìm hiểu.
 ```
 
 <br />
