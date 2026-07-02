@@ -116,6 +116,9 @@ class Settings(BaseSettings):
     PORT: int = 8000
     WORKERS: int = 1  # Uvicorn worker count — each WebSocket connection is process-local, no shared state needed
 
+    # ── Logging ──────────────────────────────────────────────────────────────
+    LOG_TRANSCRIPT_CONTENT: bool = False  # log actual transcript text in StreamingHandler; keep False in production (PII)
+
     model_config = {
         "env_file": ".env",
         "env_file_encoding": "utf-8",

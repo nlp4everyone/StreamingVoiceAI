@@ -205,10 +205,11 @@ class StreamingHandler:
         """
         # Step 1: Log turn-level ASR count on first finalize call (reset prevents double-log)
         if session.asr_call_count > 0:
-            logger.info(
-                "[%s] Turn ended — ASR calls this turn: %d",
-                session.session_id, session.asr_call_count,
-            )
+            if settings.LOG_TRANSCRIPT_CONTENT:
+                logger.info(
+                    "[%s] Turn ended — ASR calls this turn: %d",
+                    session.session_id, session.asr_call_count,
+                )
             session.asr_call_count = 0
 
         # Step 2: Guard — nothing to finalize
@@ -222,10 +223,11 @@ class StreamingHandler:
                 session.asr_call_count += 1
                 transcript = await self.transcription_service.atranscribe(audio)
                 if transcript:
-                    logger.debug(
-                        "[%s] Right-finalize ASR result: '%s'",
-                        session.session_id, transcript,
-                    )
+                    if settings.LOG_TRANSCRIPT_CONTENT:
+                        logger.debug(
+                            "[%s] Right-finalize ASR result: '%s'",
+                            session.session_id, transcript,
+                        )
                     # Run through stabilizer to apply frozen prefix — prevents raw ASR
                     # from overwriting already-committed text with "Unk" or regressions.
                     stabilized = self.stabilization_service.stabilize(
@@ -237,7 +239,8 @@ class StreamingHandler:
         # Step 3: Promote partial to final and send the committed text to the client
         session.transcript_state.finalize()
         final_text = session.transcript_state.final_transcript.strip()
-        logger.info("[%s] Final transcript: '%s'", session.session_id, final_text)
+        if settings.LOG_TRANSCRIPT_CONTENT:
+            logger.info("[%s] Final transcript: '%s'", session.session_id, final_text)
         await self.connection_manager.send_transcript(
             session.session_id, final_text, is_final=True
         )
@@ -264,10 +267,11 @@ class StreamingHandler:
             vad.intra_committed = True
             session.transcript_state.finalize()
             committed_text = session.transcript_state.final_transcript.strip()
-            logger.info(
-                "[%s] Intra-utterance commit at %.0f ms pause: '%s'",
-                session.session_id, vad.silence_duration_ms, committed_text,
-            )
+            if settings.LOG_TRANSCRIPT_CONTENT:
+                logger.info(
+                    "[%s] Intra-utterance commit at %.0f ms pause: '%s'",
+                    session.session_id, vad.silence_duration_ms, committed_text,
+                )
             # Step 3: Send committed text to client as a final segment
             await self.connection_manager.send_transcript(
                 session.session_id, committed_text, is_final=True
@@ -472,7 +476,8 @@ class StreamingHandler:
 
                         if stabilized.strip() != session.transcript_state.partial_transcript.strip():
                             session.transcript_state.update_partial(stabilized)
-                            logger.info(f"[{session.session_id}] Partial transcript: '{stabilized}'")
+                            if settings.LOG_TRANSCRIPT_CONTENT:
+                                logger.info(f"[{session.session_id}] Partial transcript: '{stabilized}'")
                             await self.connection_manager.send_transcript(
                                 session.session_id, stabilized, is_final=False
                             )

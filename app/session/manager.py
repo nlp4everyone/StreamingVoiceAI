@@ -25,7 +25,7 @@ class SessionManager:
     
     def create_session(self) -> StreamingSession:
         """Create a new streaming session."""
-        session_id = str(uuid.uuid4())
+        session_id = f"session_{uuid.uuid4()}"
         session = StreamingSession(session_id)
         self.sessions[session_id] = session
         logger.debug(f"Session created: {session_id} (total: {len(self.sessions)})")
